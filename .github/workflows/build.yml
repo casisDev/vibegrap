@@ -120,6 +120,35 @@ jobs:
             installer_output/VibeGrap-App-*.zip.sha256
           if-no-files-found: error
 
+      - name: Montar as notas do Release (CHANGELOG.md + avisos fixos)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $out = @(); $on = $false
+          foreach ($l in (Get-Content CHANGELOG.md -Encoding utf8)) {
+            if ($l -match '^##\s') {
+              if ($on) { break }
+              if ($l -match ("^##\s+\[?v?" + [regex]::Escape($v) + "\]?(\s|$)")) { $on = $true }
+              continue
+            }
+            if ($on) { $out += $l }
+          }
+          $notes = ($out -join "`n").Trim()
+          if (!$notes) { $notes = "Veja o CHANGELOG.md para as mudanças desta versão." }
+          $fixed = @(
+            "---",
+            "Instalador do **VibeGrap** para Windows. Baixe **VibeGrap-Setup.exe**, abra e siga o assistente.",
+            "",
+            '- O Windows pode mostrar "O Windows protegeu o computador" (o instalador não é assinado): clique em **Mais informações → Executar assim mesmo**.',
+            '- Programa de "vibe coding" desenvolvido por casisDev com ajuda de IA, com testes mas sem auditoria profissional; veja o README.',
+            "- O instalador inclui FFmpeg (GPL v3) e outros componentes: veja THIRD_PARTY_NOTICES.md para licenças e código-fonte.",
+            '- Os arquivos `VibeGrap-App-*.zip` e `.sha256` são o pacote leve de atualização: o botão de atualizar do programa os usa sozinho (não precisa baixá-los).',
+            "- Use apenas para conteúdo que você tem o direito de baixar."
+          ) -join "`n"
+          Set-Content -Path release_notes.md -Value ($notes + "`n`n" + $fixed) -Encoding utf8
+          Get-Content release_notes.md
+
       - name: Publicar na página Releases (só quando há tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -128,12 +157,5 @@ jobs:
             installer_output/VibeGrap-Setup.exe
             installer_output/VibeGrap-App-*.zip
             installer_output/VibeGrap-App-*.zip.sha256
+          body_path: release_notes.md
           generate_release_notes: true
-          body: |
-            Instalador do **VibeGrap** para Windows. Baixe **VibeGrap-Setup.exe**, abra e siga o assistente.
-
-            - O Windows pode mostrar "O Windows protegeu o computador" (o instalador não é assinado): clique em **Mais informações → Executar assim mesmo**.
-            - Programa de "vibe coding" desenvolvido por casisDev com ajuda de IA, com testes mas sem auditoria profissional; veja o README.
-            - O instalador inclui FFmpeg (GPL v3) e outros componentes: veja THIRD_PARTY_NOTICES.md para licenças e código-fonte.
-            - Os arquivos `VibeGrap-App-*.zip` e `.sha256` são o pacote leve de atualização: o botão de atualizar do programa os usa sozinho (não precisa baixá-los).
-            - Use apenas para conteúdo que você tem o direito de baixar.
