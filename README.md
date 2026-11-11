@@ -1,7 +1,7 @@
 # VibeGrap
 
 > ### Programa de *vibe coding*, desenvolvido por **casisDev**
-> O VibeGrap foi criado por **casisDev** através de *vibe coding*: ele descreveu o que queria em linguagem natural e o código foi escrito e testado com a ajuda de uma IA (**Claude**, da Anthropic). Detalhes em [Sobre este projeto](#sobre-este-projeto).
+> O VibeGrap foi criado por **casisDev** através de *vibe coding*: ele descreveu o que queria em linguagem natural e o código foi escrito e testado com a ajuda de uma IA. Detalhes em [Sobre este projeto](#sobre-este-projeto).
 
 Interface gráfica moderna, em português, para o [yt-dlp](https://github.com/yt-dlp/yt-dlp): baixe vídeos e áudios escolhendo qualidade, **faixa de áudio (idioma/dublagem)**, legendas, itens de playlist e trechos, com fila de downloads e **progresso total** (itens, bytes, velocidade e tempo restante).
 
@@ -65,7 +65,7 @@ python ytdlp_gui.py
 
 ## Sobre este projeto
 
-O **VibeGrap** é um programa de **“vibe coding” desenvolvido por casisDev**: ele descreveu em linguagem natural o que queria e o código foi escrito, testado e refinado de forma iterativa com a ajuda de um assistente de IA (**Claude**, da Anthropic). O autor humano dirigiu o resultado e é quem publica e mantém o projeto.
+O **VibeGrap** é um programa de **“vibe coding” desenvolvido por casisDev**: ele descreveu em linguagem natural o que queria e o código foi escrito, testado e refinado de forma iterativa com a ajuda de um assistente de IA. O autor humano dirigiu o resultado e é quem publica e mantém o projeto.
 
 O que isso significa para você:
 
