@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.spec
+installer_output/
+ffmpeg.zip
+deno.zip
+ffmpeg_tmp/
+deno_tmp/
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,109 @@
+name: Construir instalador (Windows)
+
+on:
+  workflow_dispatch:          # botão "Run workflow" na aba Actions
+  push:
+    branches: [main, master]  # a cada envio de arquivos
+    tags: ["v*"]              # ao criar uma versão (v2.0.0, v2.1.0...), também publica o Setup.exe na página Releases
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Definir a versão e o repositório (usados pelo botão de atualização do programa)
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/v*") { $v = $env:GITHUB_REF_NAME.TrimStart("v") } else { $v = "2.0.$env:GITHUB_RUN_NUMBER" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Set-Content -Path assets/version.txt -Value $v -NoNewline -Encoding ascii
+          Set-Content -Path assets/update_repo.txt -Value $env:GITHUB_REPOSITORY -NoNewline -Encoding ascii
+          "Versão: $v  |  Repositório: $env:GITHUB_REPOSITORY"
+
+      - name: Gerar o programa (PyInstaller)
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --windowed `
+            --name VibeGrap --icon assets/VibeGrap_icon.ico `
+            --add-data "assets;assets" `
+            --collect-all customtkinter `
+            --collect-submodules yt_dlp `
+            --collect-all yt_dlp_ejs `
+            --collect-all certifi `
+            --hidden-import mutagen --hidden-import Cryptodome `
+            --hidden-import PIL._imagingtk --hidden-import PIL._tkinter_finder `
+            --hidden-import PIL.ImageTk `
+            --hidden-import brotli --hidden-import websockets `
+            ytdlp_gui.py
+          if (!(Test-Path "dist/VibeGrap/VibeGrap.exe")) { throw "O PyInstaller não gerou o .exe" }
+
+      - name: Baixar ffmpeg e Deno (vão dentro do instalador)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = "dist/VibeGrap"
+
+          Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          Get-ChildItem ffmpeg_tmp -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination $dest
+
+          # Licenças que precisam acompanhar os programas de terceiros
+          New-Item -ItemType Directory -Force "$dest/licenses" | Out-Null
+          $ffl = Get-ChildItem ffmpeg_tmp -Recurse -Filter LICENSE.txt | Select-Object -First 1
+          if ($ffl) { Copy-Item $ffl.FullName "$dest/licenses/ffmpeg-LICENSE-GPLv3.txt" } else { Invoke-WebRequest "https://www.gnu.org/licenses/gpl-3.0.txt" -OutFile "$dest/licenses/ffmpeg-LICENSE-GPLv3.txt" }
+
+          Invoke-WebRequest "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
+          Expand-Archive deno.zip -DestinationPath deno_tmp
+          Copy-Item deno_tmp/deno.exe $dest
+          Invoke-WebRequest "https://raw.githubusercontent.com/denoland/deno/main/LICENSE.md" -OutFile "$dest/licenses/deno-LICENSE.md"
+
+          foreach ($f in "ffmpeg.exe", "ffprobe.exe", "deno.exe") {
+            if (!(Test-Path "$dest/$f")) { throw "$f não foi encontrado" }
+          }
+          & "$dest/ffmpeg.exe" -version | Select-Object -First 1
+          & "$dest/deno.exe" --version | Select-Object -First 1
+
+      - name: Gerar o instalador (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (!$iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (!(Test-Path $iscc)) { choco install innosetup --no-progress -y; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" installer.iss
+          if (!(Test-Path "installer_output/VibeGrap-Setup.exe")) { throw "O instalador não foi gerado" }
+
+      - name: Guardar o instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: VibeGrap-Setup
+          path: installer_output/VibeGrap-Setup.exe
+          if-no-files-found: error
+
+      - name: Publicar na página Releases (só quando há tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_output/VibeGrap-Setup.exe
+          generate_release_notes: true
+          body: |
+            Instalador do **VibeGrap** para Windows. Baixe **VibeGrap-Setup.exe**, abra e siga o assistente.
+
+            - O Windows pode mostrar "O Windows protegeu o computador" (o instalador não é assinado): clique em **Mais informações → Executar assim mesmo**.
+            - Programa de "vibe coding" desenvolvido por casisDev com ajuda de IA, com testes mas sem auditoria profissional; veja o README.
+            - O instalador inclui FFmpeg (GPL v3) e outros componentes: veja THIRD_PARTY_NOTICES.md para licenças e código-fonte.
+            - Use apenas para conteúdo que você tem o direito de baixar.
