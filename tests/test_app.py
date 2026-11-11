@@ -945,7 +945,7 @@ for fname in ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "CONTRIBUTING.md
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README: autoria casisDev e vibe coding logo no começo",
       "casisDev" in "\n".join(readme.splitlines()[:6]) and "vibe coding" in "\n".join(readme.splitlines()[:6]).lower(), readme.splitlines()[2:4])
-check("README: declara vibe coding com IA", "vibe coding" in readme.lower() and "Claude" in readme)
+check("README: declara vibe coding com IA", "vibe coding" in readme.lower() and __import__("re").search(r"\bIA\b|inteligência artificial", readme) is not None)
 check("README: aviso de uso responsável e de não afiliação", "Uso responsável" in readme and "não é afiliado" in readme)
 notices = open(os.path.join(ROOT, "THIRD_PARTY_NOTICES.md"), encoding="utf-8").read()
 for comp in ("yt-dlp", "FFmpeg", "Deno", "customtkinter", "Pillow", "mutagen", "GPL"):
