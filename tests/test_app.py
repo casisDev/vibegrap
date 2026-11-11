@@ -9,6 +9,7 @@ import http.server
 import importlib.util
 import io
 import os
+import queue
 import shutil
 import socketserver
 import subprocess
@@ -139,7 +140,7 @@ def txt(widget):
     return widget.cget("text")
 
 
-check("UI: 5 páginas", set(app.pages) == {"download", "queue", "settings", "tools", "log"}, list(app.pages))
+check("UI: 6 páginas", set(app.pages) == {"download", "queue", "history", "settings", "tools", "log"}, list(app.pages))
 check("UI: janela cabe na tela", app.winfo_width() <= app.winfo_screenwidth() + 5)
 for name in app.pages:
     app._show(name)
@@ -645,6 +646,289 @@ g.webbrowser.open = real_open
 g.subprocess.Popen = real_popen
 gh.shutdown()
 
+
+# ------------------------------------------------------------ atualização leve (só VibeGrap.exe + assets)
+import hashlib as _hl  # noqa: E402
+import queue as _queue  # noqa: E402
+
+BASE_ID = "0123456789abcdef"
+
+
+def make_patch_zip(path, extra=None, exe=b"MZ-novo", skip_exe=False, names=None):
+    with zipfile.ZipFile(path, "w") as z:
+        if not skip_exe:
+            z.writestr("VibeGrap.exe", exe)
+        z.writestr("_internal/assets/version.txt", "9.9.9")
+        z.writestr("_internal/assets/novo.txt", "arquivo novo")
+        z.writestr("LICENSE", "MIT novo")
+        for n, data in (extra or {}).items():
+            z.writestr(n, data)
+    return path
+
+
+good_zip = make_patch_zip(os.path.join(TMP, "patch_ok.zip"))
+GZ = open(good_zip, "rb").read()
+pstate = {"sha": _hl.sha256(GZ).hexdigest(), "nosha": False}
+
+
+class FakePatch(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a, **k):
+        pass
+
+    def do_GET(self):
+        if self.path == "/dl/patch.zip":
+            body = GZ
+        elif self.path == "/dl/patch.zip.sha256" and not pstate["nosha"]:
+            body = (pstate["sha"] + "  VibeGrap-App.zip\n").encode()
+        elif self.path == "/dl/setup.exe":
+            body = SETUP_BYTES
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+ps = Srv(("127.0.0.1", 0), FakePatch)
+threading.Thread(target=ps.serve_forever, daemon=True).start()
+PB = f"http://127.0.0.1:{ps.server_address[1]}"
+real_api = g.UPDATE_API
+g.UPDATE_API = PB
+pinfo = {"repo": "dono/repo", "version": "9.9.9", "notes": "", "page": "https://github.com/dono/repo/releases",
+         "patch_url": PB + "/dl/patch.zip", "patch_sha_url": PB + "/dl/patch.zip.sha256", "patch_size": len(GZ),
+         "asset_url": PB + "/dl/setup.exe", "asset_size": len(SETUP_BYTES)}
+
+# --- escolha dos arquivos na Release
+rel_assets = [
+    {"name": "VibeGrap-Setup.exe", "browser_download_url": "https://github.com/dono/repo/releases/download/v9/VibeGrap-Setup.exe", "size": 5},
+    {"name": f"VibeGrap-App-{BASE_ID}.zip", "browser_download_url": "https://github.com/dono/repo/releases/download/v9/a.zip", "size": 7},
+    {"name": f"VibeGrap-App-{BASE_ID}.zip.sha256", "browser_download_url": "https://github.com/dono/repo/releases/download/v9/a.sha", "size": 64},
+]
+rel_state = {"assets": rel_assets}
+
+
+class FakeRel(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a, **k):
+        pass
+
+    def do_GET(self):
+        body = _json.dumps({"tag_name": "v9.9.9", "body": "", "assets": rel_state["assets"]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+rs = Srv(("127.0.0.1", 0), FakeRel)
+threading.Thread(target=rs.serve_forever, daemon=True).start()
+RB = f"http://127.0.0.1:{rs.server_address[1]}"
+r1 = g.fetch_latest_release("dono/repo", api=RB, base=BASE_ID)
+check("leve: Release com pacote da mesma impressão digital oferece o pacote leve",
+      r1["patch_url"].endswith("/a.zip") and r1["patch_sha_url"].endswith("/a.sha") and r1["patch_size"] == 7 and r1["asset_url"].endswith("Setup.exe"), r1)
+r2 = g.fetch_latest_release("dono/repo", api=RB, base="fedcba9876543210")
+check("leve: impressão digital diferente (bibliotecas mudaram) -> só o instalador completo", r2["patch_url"] is None and r2["asset_url"], r2)
+r3 = g.fetch_latest_release("dono/repo", api=RB, base="")
+check("leve: programa sem impressão digital (versão antiga) -> só o instalador completo", r3["patch_url"] is None and r3["asset_url"], r3)
+rel_state["assets"] = rel_assets[:2]
+r4 = g.fetch_latest_release("dono/repo", api=RB, base=BASE_ID)
+check("leve: pacote sem o arquivo de hash é ignorado", r4["patch_url"] is None and r4["patch_sha_url"] is None, r4)
+rel_state["assets"] = rel_assets
+check("leve: impressão digital malformada é ignorada", g.fetch_latest_release("dono/repo", api=RB, base="../x")["patch_url"] is None)
+rs.shutdown()
+
+# --- escolha do modo
+check("leve: modo 'patch' no Windows instalado com pasta gravável", g.pick_update_mode(pinfo, frozen=True, win=True, app_dir=TMP) == "patch")
+check("leve: pasta sem permissão de escrita -> instalador completo", g.pick_update_mode(pinfo, frozen=True, win=True, app_dir=os.path.join(TMP, "nao_existe")) == "installer")
+check("leve: sem pacote -> instalador completo", g.pick_update_mode(dict(pinfo, patch_url=None), frozen=True, win=True, app_dir=TMP) == "installer")
+check("leve: rodando pelo código-fonte ou fora do Windows -> abre a página", g.pick_update_mode(pinfo, frozen=False, win=True, app_dir=TMP) == "page" and g.pick_update_mode(pinfo, frozen=True, win=False, app_dir=TMP) == "page")
+
+# --- download com conferência
+pz = os.path.join(TMP, "dl_patch.zip")
+seen = []
+g.download_patch(pinfo, pz, seen.append)
+check("leve: baixa o pacote e confere o hash", open(pz, "rb").read() == GZ and seen and seen[-1] == 100.0)
+pstate["sha"] = "0" * 64
+try:
+    g.download_patch(pinfo, pz)
+    check("leve: hash errado é recusado e o arquivo apagado", False)
+except RuntimeError:
+    check("leve: hash errado é recusado e o arquivo apagado", not os.path.exists(pz))
+pstate["sha"] = _hl.sha256(GZ).hexdigest()
+try:
+    g.download_patch(dict(pinfo, patch_size=len(GZ) + 1), pz)
+    check("leve: tamanho errado é recusado", False)
+except RuntimeError:
+    check("leve: tamanho errado é recusado", not os.path.exists(pz))
+try:
+    g.download_patch(dict(pinfo, patch_url="http://evil.example/p.zip"), pz)
+    check("leve: endereço de fora do repositório é recusado", False)
+except RuntimeError:
+    check("leve: endereço de fora do repositório é recusado", True)
+pstate["nosha"] = True
+try:
+    g.download_patch(pinfo, pz)
+    check("leve: sem arquivo de hash nada é instalado", False)
+except Exception:
+    check("leve: sem arquivo de hash nada é instalado", not os.path.exists(pz))
+pstate["nosha"] = False
+
+# --- extração segura
+st = g.extract_patch(good_zip, os.path.join(TMP, "stage1"))
+check("leve: extrai exe, assets e licença", open(os.path.join(st, "VibeGrap.exe"), "rb").read() == b"MZ-novo"
+      and open(os.path.join(st, "_internal", "assets", "novo.txt")).read() == "arquivo novo" and os.path.isfile(os.path.join(st, "LICENSE")))
+for label, kw in (("caminho com '..' (zip-slip)", {"extra": {"_internal/assets/../../evil.txt": "x"}}),
+                  ("arquivo fora da lista (.dll)", {"extra": {"python312.dll": "x"}}),
+                  ("caminho absoluto", {"extra": {"/etc/x": "x"}}),
+                  ("sem o VibeGrap.exe", {"skip_exe": True}),
+                  ("exe que não é executável", {"exe": b"texto"})):
+    bad = make_patch_zip(os.path.join(TMP, "bad.zip"), **kw)
+    try:
+        g.extract_patch(bad, os.path.join(TMP, "stage_bad"))
+        check("leve: recusa " + label, False)
+    except RuntimeError:
+        check("leve: recusa " + label, not os.path.exists(os.path.join(TMP, "evil.txt")))
+
+# --- troca dos arquivos (com desfazer)
+def make_app(name):
+    d = os.path.join(TMP, name)
+    os.makedirs(os.path.join(d, "_internal", "assets"), exist_ok=True)
+    open(os.path.join(d, "VibeGrap.exe"), "wb").write(b"MZ-antigo")
+    open(os.path.join(d, "_internal", "assets", "version.txt"), "w").write("2.0.0")
+    open(os.path.join(d, "_internal", "assets", "so_no_antigo.txt"), "w").write("fica")
+    open(os.path.join(d, "ffmpeg.exe"), "wb").write(b"FFMPEG")
+    return d
+
+
+appd = make_app("app_ok")
+exe = g.apply_patch(st, appd)
+rd = lambda *a: open(os.path.join(appd, *a), "rb").read()  # noqa: E731
+check("leve: troca o .exe e guarda o antigo como .old", rd("VibeGrap.exe") == b"MZ-novo" and rd("VibeGrap.exe.old") == b"MZ-antigo" and exe.endswith("VibeGrap.exe"))
+check("leve: atualiza os assets e a licença, sem apagar o resto", rd("_internal", "assets", "version.txt") == b"9.9.9"
+      and rd("_internal", "assets", "novo.txt") == b"arquivo novo" and rd("_internal", "assets", "so_no_antigo.txt") == b"fica" and rd("LICENSE") == b"MIT novo")
+check("leve: não mexe no ffmpeg/Deno", rd("ffmpeg.exe") == b"FFMPEG")
+check("leve: não sobra pasta de desfazer", not os.path.exists(os.path.join(TMP, "stage1_rollback")))
+# aplicar de novo (já existe .old de antes)
+g.apply_patch(st, appd)
+check("leve: aplicar de novo funciona mesmo com .old antigo", rd("VibeGrap.exe") == b"MZ-novo" and rd("VibeGrap.exe.old") == b"MZ-novo")
+
+# falha ao copiar o .exe novo: tudo volta ao que era
+appd = make_app("app_fail1")
+real_copy2 = g.shutil.copy2
+
+
+def boom(*a, **k):
+    raise OSError("disco cheio")
+
+
+g.shutil.copy2 = boom
+try:
+    g.apply_patch(st, appd)
+    check("leve: falha ao copiar o .exe é propagada", False)
+except OSError:
+    check("leve: falha ao copiar o .exe é propagada", True)
+g.shutil.copy2 = real_copy2
+check("leve: falha ao copiar o .exe -> programa antigo continua intacto", rd("VibeGrap.exe") == b"MZ-antigo" and not os.path.exists(os.path.join(appd, "VibeGrap.exe.old")))
+
+# falha nos assets (depois de trocar o .exe): .exe e assets voltam ao que eram
+appd = make_app("app_fail2")
+real_ct = g.shutil.copytree
+calls_ct = []
+
+
+def flaky_copytree(src, dst, **k):
+    calls_ct.append(dst)
+    if len(calls_ct) == 2:  # 1ª = cópia de segurança; 2ª = assets novos
+        raise OSError("arquivo em uso")
+    return real_ct(src, dst, **k)
+
+
+g.shutil.copytree = flaky_copytree
+try:
+    g.apply_patch(st, appd)
+    check("leve: falha nos assets é propagada", False)
+except OSError:
+    check("leve: falha nos assets é propagada", True)
+g.shutil.copytree = real_ct
+check("leve: falha nos assets -> .exe e assets antigos voltam", rd("VibeGrap.exe") == b"MZ-antigo" and rd("_internal", "assets", "version.txt") == b"2.0.0"
+      and not os.path.exists(os.path.join(appd, "VibeGrap.exe.old")))
+
+# limpeza na abertura seguinte
+appd = make_app("app_clean")
+open(os.path.join(appd, "VibeGrap.exe.old"), "wb").write(b"x")
+real_exe, real_frozen = g.sys.executable, g.FROZEN
+g.sys.executable, g.FROZEN = os.path.join(appd, "VibeGrap.exe"), True
+g.cleanup_after_patch()
+g.sys.executable, g.FROZEN = real_exe, real_frozen
+check("leve: na abertura seguinte apaga o .exe antigo", not os.path.exists(os.path.join(appd, "VibeGrap.exe.old")))
+
+# --- fluxo completo do botão (sem fechar o teste)
+real_pm = (g.FROZEN, g.IS_WIN, g.exe_dir, g.subprocess.Popen)
+appd = make_app("app_flow")
+fake_exe_name = os.path.basename(g.sys.executable)
+open(os.path.join(appd, fake_exe_name), "wb").write(b"MZ-antigo")
+g.FROZEN, g.IS_WIN, g.exe_dir = True, True, (lambda: appd)
+launched = []
+g.subprocess.Popen = lambda cmd, **k: launched.append((cmd, k)) or None
+
+
+def drain():
+    out = []
+    while True:
+        try:
+            out.append(app.q.get_nowait())
+        except _queue.Empty:
+            return out
+
+
+drain()
+app._update_download_worker(pinfo)
+msgs = [m for m in drain() if m[0] == "upd"]
+done = msgs[-1]
+check("leve: botão baixa o pacote leve e troca os arquivos", done[1] == "done" and done[3] is None and len(done) > 4 and done[4] == "patch"
+      and open(os.path.join(appd, fake_exe_name), "rb").read() == b"MZ-novo" and open(os.path.join(appd, "_internal", "assets", "version.txt")).read() == "9.9.9", done)
+quit_calls = []
+real_quit = app._quit_for_update
+app._quit_for_update = lambda: quit_calls.append(1)
+app.upd_win = None
+app.upd_msg = type("M", (), {"configure": lambda self, **k: None})()
+app._on_upd_msg(done)
+pump(0.8)
+check("leve: depois de trocar, o programa reabre e fecha o antigo", launched and launched[-1][0] == [done[2]] and quit_calls
+      and launched[-1][1].get("env", {}).get("PYINSTALLER_RESET_ENVIRONMENT") == "1", launched)
+
+# pacote leve falha (hash errado) -> cai no instalador completo
+appd2 = make_app("app_flow2")
+open(os.path.join(appd2, fake_exe_name), "wb").write(b"MZ-antigo")
+g.exe_dir = lambda: appd2
+pstate["sha"] = "f" * 64
+drain()
+app._update_download_worker(pinfo)
+msgs = [m for m in drain() if m[0] == "upd"]
+txts = [m for m in msgs if m[1] == "txt"]
+done2 = msgs[-1]
+check("leve: pacote com problema -> avisa e baixa o instalador completo", txts and done2[1] == "done" and done2[3] is None and len(done2) == 4
+      and open(done2[2], "rb").read() == SETUP_BYTES and open(os.path.join(appd2, fake_exe_name), "rb").read() == b"MZ-antigo", (txts, done2))
+pstate["sha"] = _hl.sha256(GZ).hexdigest()
+
+# pacote leve falha e não há instalador na Release -> erro mostrado
+drain()
+pstate["sha"] = "f" * 64
+app._update_download_worker(dict(pinfo, asset_url=None))
+done3 = [m for m in drain() if m[0] == "upd"][-1]
+check("leve: sem pacote bom e sem instalador -> mensagem de erro", done3[1] == "done" and done3[2] is None and done3[3], done3)
+pstate["sha"] = _hl.sha256(GZ).hexdigest()
+
+app._quit_for_update = real_quit
+g.FROZEN, g.IS_WIN, g.exe_dir, g.subprocess.Popen = real_pm
+g.UPDATE_API = real_api
+ps.shutdown()
+check("leve: o pacote leve vem do mesmo workflow (impressão digital + zip + hash)",
+      all(t in open(os.path.join(ROOT, ".github", "workflows", "build.yml"), encoding="utf-8").read()
+          for t in ("base_id.txt", "VibeGrap-App-", ".sha256", "pip freeze")))
+
 check("ferramentas: lista componentes", "yt-dlp" in app.v_tools.get() and "ffmpeg" in app.v_tools.get(), app.v_tools.get().replace("\n", " | "))
 app._about_dialog()
 pump(0.3)
@@ -675,6 +959,213 @@ import json  # noqa: E402
 
 saved = json.load(open(g.SETTINGS_FILE, encoding="utf-8"))
 check("config salva (tema e pasta)", saved.get("theme") == "Claro" and saved.get("folder") == out5, saved.get("theme"))
+# ------------------------------------------------------------ erros em português
+FE = g.friendly_error
+check("erro: vídeo privado", "privado" in FE("ERROR: [youtube] abc: Private video. Sign in if you've been granted access"), FE("ERROR: [youtube] abc: Private video. Sign in"))
+check("erro: restrição de idade", "idade" in FE("ERROR: Sign in to confirm your age. This video may be inappropriate"))
+check("erro: anti-robô do YouTube", "anti-robô" in FE("ERROR: Sign in to confirm you’re not a bot"))
+check("erro: região bloqueada", "região" in FE("The uploader has not made this video available in your country"))
+check("erro: vídeo removido", "indisponível" in FE("ERROR: Video unavailable. This video has been removed by the uploader"))
+check("erro: sem internet", "conexão" in FE("<urlopen error [Errno -2] Name or service not known>") and "conexão" in FE("Unable to download webpage: timed out"))
+check("erro: 429 e 403", "limitou" in FE("HTTP Error 429: Too Many Requests") and "403" in FE("HTTP Error 403: Forbidden"))
+check("erro: ffmpeg ausente", "ffmpeg" in FE("ERROR: Postprocessing: ffprobe and ffmpeg not found"))
+check("erro: disco cheio e permissão", "disco" in FE("[Errno 28] No space left on device") and "permissão" in FE("[Errno 13] Permission denied: 'x'"))
+check("erro: formato indisponível", "Melhor disponível" in FE("ERROR: Requested format is not available"))
+check("erro: link não suportado", "suportado" in FE("ERROR: Unsupported URL: https://example.com/x"))
+check("erro: desconhecido mostra o texto limpo", FE("\x1b[0;31mERROR:\x1b[0m [x] 12: algo estranho") == "algo estranho", FE("\x1b[0;31mERROR:\x1b[0m [x] 12: algo estranho"))
+check("erro: vazio tem mensagem padrão", "Registro" in FE(""))
+check("erro: nunca vaza código de cor", "\x1b" not in FE("\x1b[31mHTTP Error 404: Not Found\x1b[0m"))
+
+# ------------------------------------------------------------ histórico
+hpath = os.path.join(TMP, "hist_test.json")
+check("histórico: arquivo ausente/corrompido vira lista vazia", g.load_history(hpath) == [] and (open(hpath, "w").write("{{{") or g.load_history(hpath) == []))
+ents = [{"title": "Música Azul", "url": "https://x/1"}, {"title": "Aula de Python", "url": "https://y/2"}]
+g.save_history(ents, hpath)
+check("histórico: salva e lê de volta", g.load_history(hpath) == ents)
+check("histórico: busca por título e por link",
+      [e["url"] for e in g.filter_history(ents, "python")] == ["https://y/2"] and len(g.filter_history(ents, "x/1")) == 1 and len(g.filter_history(ents, "  ")) == 2)
+
+g.HISTORY_FILE = os.path.join(TMP, "hist_app.json")
+app.history = []
+app._show("history")
+app._render_history()
+check("histórico: página vazia mostra aviso", "Ainda não" in app.lbl_hempty.cget("text"), app.lbl_hempty.cget("text"))
+fake_item = {"url": "https://x/9", "title": "[Playlist] Meu Mix", "done": 5_000_000, "opts": {"paths": {"home": TMP}}}
+app._record_history(fake_item, "Concluído")
+app._record_history(dict(fake_item, url="https://x/10", title="Vídeo com problema"), "Erro")
+check("histórico: registra concluído e erro (mais novo primeiro)",
+      len(app.history) == 2 and app.history[0]["status"] == "Erro" and app.history[1]["title"] == "Meu Mix"
+      and app.history[1]["size"] == 5_000_000 and app.history[1]["folder"] == TMP, app.history)
+check("histórico: gravado em disco", len(g.load_history()) == 2)
+check("histórico: página lista os dois itens", len(app.hframe.winfo_children()) == 2, len(app.hframe.winfo_children()))
+app.v_hsearch.set("mix")
+check("histórico: busca filtra a lista", len(app.hframe.winfo_children()) == 1, len(app.hframe.winfo_children()))
+app.v_hsearch.set("zzz")
+check("histórico: busca sem resultado avisa", "Nada encontrado" in app.lbl_hempty.cget("text"))
+app.v_hsearch.set("")
+app._reuse_url("https://x/9")
+check("histórico: 'Usar de novo' coloca o link na tela de download", app._url() == "https://x/9")
+app._copy_text("https://x/9")
+check("histórico: 'Copiar link' copia", app.clipboard_get() == "https://x/9")
+app._on_state(next(iter(app.items)) if app.items else "nenhum", "Concluído", None)  # id inexistente não quebra
+for i in range(g.HISTORY_MAX + 20):
+    app.history.insert(0, {"title": str(i), "url": f"https://x/{i}"})
+app._record_history(fake_item, "Concluído")
+check("histórico: limite de itens respeitado", len(app.history) == g.HISTORY_MAX and len(g.load_history()) == g.HISTORY_MAX, len(app.history))
+g.messagebox.askyesno = lambda *a, **k: True
+app._clear_history()
+check("histórico: limpar apaga tudo (com confirmação)", app.history == [] and g.load_history() == [])
+app._show("download")
+app._record_history(fake_item, "Concluído")
+check("histórico: aba fechada não redesenha a lista (só marca para depois)", app.hist_dirty and len(app.hframe.winfo_children()) == 0)
+app._show("history")
+check("histórico: ao abrir a aba a lista é desenhada", not app.hist_dirty and len(app.hframe.winfo_children()) == 1)
+app._show("download")
+
+# ------------------------------------------------------------ aviso ao terminar
+app._toast("Teste", "Mensagem de teste", ms=60000)
+app.update()
+check("aviso: janelinha aparece", app.toast_win is not None and app.toast_win.winfo_exists())
+app.toast_win.destroy()
+shown = []
+real_toast, real_should = app._toast, app._should_notify
+app._toast = lambda title, text, ms=0: shown.append((title, text))
+app._should_notify = lambda: True
+app.v_notify.set(True)
+app.cancel.clear()
+app.run_ids = set()
+app._on_fim(2, 1)
+check("aviso: ao terminar mostra o resumo", shown and "2 com sucesso" in shown[-1][1] and "erros" in shown[-1][0], shown)
+shown.clear()
+app.v_notify.set(False)
+app._on_fim(1, 0)
+check("aviso: desligado nas configurações, não avisa", not shown)
+app.v_notify.set(True)
+app._should_notify = lambda: False
+app._on_fim(1, 0)
+check("aviso: janela em primeiro plano, não avisa", not shown)
+app._on_fim(0, 0)
+app.cancel.set()
+app._should_notify = lambda: True
+app._on_fim(1, 0)
+check("aviso: cancelado, não avisa", not shown)
+app.cancel.clear()
+app._toast, app._should_notify = real_toast, real_should
+check("aviso: padrão ligado e salvo nas configurações", g.DEFAULT_CFG["notify"] is True and "notify" in g.DEFAULT_CFG)
+
+# ------------------------------------------------------------ atualização automática do yt-dlp
+import hashlib  # noqa: E402
+
+zbuf = io.BytesIO()
+with zipfile.ZipFile(zbuf, "w") as z:
+    z.writestr("yt_dlp/__init__.py", "# falso")
+    z.writestr("yt_dlp/version.py", "__version__ = '2099.01.01'")
+YZ = zbuf.getvalue()
+ysrv_state = {"tag": "v2099.01.01", "sums": hashlib.sha256(YZ).hexdigest(), "body": YZ, "nosums": False}
+
+
+class FakeYt(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a, **k):
+        pass
+
+    def do_GET(self):
+        if self.path == "/api":
+            body = _json.dumps({"tag_name": ysrv_state["tag"]}).encode()
+        elif self.path == "/yt-dlp":
+            body = ysrv_state["body"]
+        elif self.path == "/SHA2-256SUMS" and not ysrv_state["nosums"]:
+            body = ("0" * 64 + "  yt-dlp.exe\n" + ysrv_state["sums"] + "  yt-dlp\n").encode()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+ys = Srv(("127.0.0.1", 0), FakeYt)
+threading.Thread(target=ys.serve_forever, daemon=True).start()
+YB = f"http://127.0.0.1:{ys.server_address[1]}"
+newp = os.path.join(TMP, "ytdlp_new")
+check("yt-dlp: lê a versão mais nova", g.ytdlp_latest_version(YB + "/api") == "2099.01.01")
+check("yt-dlp: detecta que há versão mais nova", g.is_newer("2099.01.01", g.YTDLP_VERSION) and not g.is_newer(g.YTDLP_VERSION, g.YTDLP_VERSION))
+check("yt-dlp: lê o hash oficial (linha certa)", g.expected_sha256(YB + "/SHA2-256SUMS") == ysrv_state["sums"])
+prog = []
+out = g.stage_ytdlp_update(prog.append, YB + "/yt-dlp", YB + "/SHA2-256SUMS", newp)
+check("yt-dlp: baixa, confere o hash e deixa pronto para a próxima abertura",
+      out == newp and open(newp, "rb").read() == YZ and prog and not os.path.exists(newp + ".part"))
+os.remove(newp)
+ysrv_state["body"] = YZ + b"adulterado"
+try:
+    g.stage_ytdlp_update(None, YB + "/yt-dlp", YB + "/SHA2-256SUMS", newp)
+    check("yt-dlp: arquivo adulterado (hash diferente) é recusado", False)
+except RuntimeError as exc:
+    check("yt-dlp: arquivo adulterado (hash diferente) é recusado", "hash" in str(exc) and not os.path.exists(newp) and not os.path.exists(newp + ".part"), exc)
+ysrv_state["body"] = YZ
+ysrv_state["nosums"] = True
+try:
+    g.stage_ytdlp_update(None, YB + "/yt-dlp", YB + "/SHA2-256SUMS", newp)
+    check("yt-dlp: sem o hash oficial não instala", False)
+except Exception:
+    check("yt-dlp: sem o hash oficial não instala", not os.path.exists(newp))
+ysrv_state["nosums"] = False
+bad = io.BytesIO()
+with zipfile.ZipFile(bad, "w") as z:
+    z.writestr("outro/arquivo.txt", "x")
+ysrv_state["body"], ysrv_state["sums"] = bad.getvalue(), hashlib.sha256(bad.getvalue()).hexdigest()
+try:
+    g.stage_ytdlp_update(None, YB + "/yt-dlp", YB + "/SHA2-256SUMS", newp)
+    check("yt-dlp: zip sem yt_dlp é recusado", False)
+except RuntimeError:
+    check("yt-dlp: zip sem yt_dlp é recusado", not os.path.exists(newp))
+ysrv_state["body"], ysrv_state["sums"] = YZ, hashlib.sha256(YZ).hexdigest()
+
+# fluxo do app: só em programa instalado, com a opção ligada; mensagens vão para o registro/barra
+g.YTDLP_LATEST_API, g.YTDLP_ZIPAPP_URL, g.YTDLP_SUMS_URL = YB + "/api", YB + "/yt-dlp", YB + "/SHA2-256SUMS"
+real_zip = g.UPDATE_ZIPAPP
+g.UPDATE_ZIPAPP = os.path.join(TMP, "appdata_yt")
+g.FROZEN = False
+app._startup_ytdlp_check()
+time.sleep(0.5)
+check("yt-dlp: rodando do código-fonte não atualiza sozinho", not os.path.exists(g.UPDATE_ZIPAPP + ".new"))
+g.FROZEN = True
+app.v_auto_ytdlp.set(False)
+app._startup_ytdlp_check()
+time.sleep(0.5)
+check("yt-dlp: opção desligada não atualiza", not os.path.exists(g.UPDATE_ZIPAPP + ".new"))
+app.v_auto_ytdlp.set(True)
+app._startup_ytdlp_check()
+for _ in range(50):
+    if os.path.exists(g.UPDATE_ZIPAPP + ".new"):
+        break
+    time.sleep(0.1)
+check("yt-dlp: atualização automática deixa o arquivo novo esperando", os.path.exists(g.UPDATE_ZIPAPP + ".new"))
+check("yt-dlp: o arquivo em uso não é trocado com o programa aberto", not os.path.exists(g.UPDATE_ZIPAPP))
+msgs = []
+while True:
+    try:
+        m = app.q.get_nowait()
+    except queue.Empty:
+        break
+    msgs.append(m)
+check("yt-dlp: avisa pela fila que há versão pronta", any(m[0] == "ytdlp" and m[1] == "staged" for m in msgs), msgs[-3:])
+app._on_ytdlp_msg(("ytdlp", "staged", "2099.01.01"))
+check("yt-dlp: mostra aviso na barra de status", "2099.01.01" in app.v_status.get(), app.v_status.get())
+app._on_ytdlp_msg(("ytdlp", "error", "sem rede"))
+check("yt-dlp: erro de rede só vai para o registro (sem janela)", "sem rede" in app.log_text.get("1.0", "end") if hasattr(app, "log_text") else True)
+# próxima abertura: o arquivo esperando vira o definitivo
+g._apply_pending_ytdlp()
+check("yt-dlp: na próxima abertura o arquivo novo entra no lugar", os.path.exists(g.UPDATE_ZIPAPP) and not os.path.exists(g.UPDATE_ZIPAPP + ".new"))
+open(g.UPDATE_ZIPAPP + ".new", "wb").write(b"lixo")
+g._apply_pending_ytdlp()
+check("yt-dlp: arquivo esperando corrompido é descartado sem trocar o bom",
+      not os.path.exists(g.UPDATE_ZIPAPP + ".new") and zipfile.is_zipfile(g.UPDATE_ZIPAPP))
+g.UPDATE_ZIPAPP = real_zip
+g.FROZEN = False
+ys.shutdown()
+
 app.destroy()
 httpd.shutdown()
 

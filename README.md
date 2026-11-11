@@ -17,6 +17,14 @@ Interface gráfica moderna, em português, para o [yt-dlp](https://github.com/yt
 - Tema claro/escuro (vermelho, branco e preto)
 - **Botão de atualização:** avisa quando há versão nova e instala com um clique
 
+## Capturas de tela
+
+<p align="center">
+  <img src="docs/tela-download.png" alt="Tela de novo download" width="48%">
+  <img src="docs/tela-fila.png" alt="Fila de downloads com progresso total" width="48%">
+</p>
+
+
 ## Instalação (Windows)
 
 1. Abra a página **[Releases](../../releases)** deste repositório.
@@ -27,7 +35,11 @@ Interface gráfica moderna, em português, para o [yt-dlp](https://github.com/yt
 
 ## Atualizações
 
-Na barra lateral do programa há o botão **Verificar atualização**. Quando existe uma versão nova publicada em **Releases**, o botão muda para **“Atualizar para vX.Y.Z”**: um clique baixa o instalador, atualiza por cima (sem perder suas configurações) e abre o programa de novo. Dá para desligar a verificação automática em **Configurações**.
+Na barra lateral do programa há o botão **Verificar atualização**. Quando existe uma versão nova publicada em **Releases**, o botão muda para **“Atualizar para vX.Y.Z”**: um clique atualiza e abre o programa de novo, sem perder suas configurações. Dá para desligar a verificação automática em **Configurações**.
+
+- **Atualização leve:** quando só o código do VibeGrap mudou, o programa baixa apenas um pacote pequeno (alguns MB, conferido por SHA-256) e troca só o `VibeGrap.exe` e os arquivos de `assets`. O ffmpeg e o Deno não são baixados de novo.
+- **Instalador completo:** usado automaticamente quando as bibliotecas embutidas mudaram, quando a pasta de instalação não permite escrever, ou se a atualização leve falhar. Quem tem uma versão anterior à atualização leve também recebe o instalador completo desta vez.
+- Cada Release traz os dois: `VibeGrap-Setup.exe` e `VibeGrap-App-<código>.zip` (com o `.sha256`). Você não precisa baixar o `.zip` à mão.
 
 ## Construir a partir do código
 

@@ -35,6 +35,15 @@ jobs:
           Set-Content -Path assets/update_repo.txt -Value $env:GITHUB_REPOSITORY -NoNewline -Encoding ascii
           "Versão: $v  |  Repositório: $env:GITHUB_REPOSITORY"
 
+          # "Impressão digital" das bibliotecas embutidas (sem o yt-dlp, que se atualiza sozinho).
+          # Se for igual à da versão instalada, o programa baixa só o pacote leve em vez do instalador inteiro.
+          $freeze = (python -m pip freeze | Where-Object { $_ -notmatch '^yt[-_]dlp==' } | Sort-Object) -join "`n"
+          Set-Content -Path base_fingerprint.txt -Value ((python --version) + "`n" + $freeze) -NoNewline -Encoding ascii
+          $base = (Get-FileHash base_fingerprint.txt -Algorithm SHA256).Hash.ToLower().Substring(0, 16)
+          "base=$base" >> $env:GITHUB_OUTPUT
+          Set-Content -Path assets/base_id.txt -Value $base -NoNewline -Encoding ascii
+          "Impressão digital das bibliotecas: $base"
+
       - name: Gerar o programa (PyInstaller)
         shell: pwsh
         run: |
@@ -51,6 +60,7 @@ jobs:
             --hidden-import brotli --hidden-import websockets `
             ytdlp_gui.py
           if (!(Test-Path "dist/VibeGrap/VibeGrap.exe")) { throw "O PyInstaller não gerou o .exe" }
+          if (!(Test-Path "dist/VibeGrap/_internal/assets/version.txt")) { throw "assets não está em _internal (o pacote leve depende disso)" }
 
       - name: Baixar ffmpeg e Deno (vão dentro do instalador)
         shell: pwsh
@@ -87,18 +97,37 @@ jobs:
           & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" installer.iss
           if (!(Test-Path "installer_output/VibeGrap-Setup.exe")) { throw "O instalador não foi gerado" }
 
-      - name: Guardar o instalador
+      - name: Gerar o pacote leve de atualização (só o VibeGrap.exe + assets)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "VibeGrap-App-${{ steps.ver.outputs.base }}.zip"
+          New-Item -ItemType Directory -Force patch_tmp/_internal | Out-Null
+          Copy-Item dist/VibeGrap/VibeGrap.exe patch_tmp/
+          Copy-Item dist/VibeGrap/_internal/assets patch_tmp/_internal/assets -Recurse
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md patch_tmp/
+          Compress-Archive -Path patch_tmp/* -DestinationPath "installer_output/$name"
+          (Get-FileHash "installer_output/$name" -Algorithm SHA256).Hash.ToLower() | Set-Content "installer_output/$name.sha256" -NoNewline -Encoding ascii
+          Get-ChildItem installer_output | Select-Object Name, Length
+
+      - name: Guardar o instalador e o pacote leve
         uses: actions/upload-artifact@v4
         with:
           name: VibeGrap-Setup
-          path: installer_output/VibeGrap-Setup.exe
+          path: |
+            installer_output/VibeGrap-Setup.exe
+            installer_output/VibeGrap-App-*.zip
+            installer_output/VibeGrap-App-*.zip.sha256
           if-no-files-found: error
 
       - name: Publicar na página Releases (só quando há tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: installer_output/VibeGrap-Setup.exe
+          files: |
+            installer_output/VibeGrap-Setup.exe
+            installer_output/VibeGrap-App-*.zip
+            installer_output/VibeGrap-App-*.zip.sha256
           generate_release_notes: true
           body: |
             Instalador do **VibeGrap** para Windows. Baixe **VibeGrap-Setup.exe**, abra e siga o assistente.
@@ -106,4 +135,5 @@ jobs:
             - O Windows pode mostrar "O Windows protegeu o computador" (o instalador não é assinado): clique em **Mais informações → Executar assim mesmo**.
             - Programa de "vibe coding" desenvolvido por casisDev com ajuda de IA, com testes mas sem auditoria profissional; veja o README.
             - O instalador inclui FFmpeg (GPL v3) e outros componentes: veja THIRD_PARTY_NOTICES.md para licenças e código-fonte.
+            - Os arquivos `VibeGrap-App-*.zip` e `.sha256` são o pacote leve de atualização: o botão de atualizar do programa os usa sozinho (não precisa baixá-los).
             - Use apenas para conteúdo que você tem o direito de baixar.

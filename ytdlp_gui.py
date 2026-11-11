@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.request
 import webbrowser
@@ -72,6 +73,12 @@ APP_VERSION = _read_asset("version.txt", "2.0.0")
 UPDATE_REPO = _read_asset("update_repo.txt")  # "dono/repositorio"
 UPDATE_API = "https://api.github.com"
 INSTALLER_ARGS = ["/SILENT", "/CLOSEAPPLICATIONS"]
+# "Impressão digital" das bibliotecas embutidas (Python, Pillow, customtkinter...). Só quando ela é igual à da
+# versão nova dá para atualizar apenas o VibeGrap.exe + assets (pacote leve); senão baixa o instalador completo.
+APP_BASE = _read_asset("base_id.txt")
+PATCH_FILES = ("VibeGrap.exe", "LICENSE", "THIRD_PARTY_NOTICES.md")  # o que o pacote leve pode trazer...
+PATCH_DIR = "_internal/assets/"                                      # ...mais tudo desta pasta
+PATCH_MAX_BYTES = 150 * 1024 * 1024
 
 
 def _data_dir():
@@ -93,9 +100,25 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 UPDATE_ZIPAPP = os.path.join(DATA_DIR, "yt-dlp")
 
 
+def _apply_pending_ytdlp():
+    """Uma atualização baixada fica em 'yt-dlp.new' e só entra no lugar na abertura seguinte.
+    (Trocar o arquivo com o programa rodando poderia misturar versões.)"""
+    new = UPDATE_ZIPAPP + ".new"
+    if not os.path.isfile(new):
+        return
+    try:
+        if zipfile.is_zipfile(new):
+            os.replace(new, UPDATE_ZIPAPP)
+        else:
+            os.remove(new)
+    except OSError:
+        pass
+
+
 def _import_ytdlp():
     import importlib
 
+    _apply_pending_ytdlp()
     if os.path.isfile(UPDATE_ZIPAPP) and zipfile.is_zipfile(UPDATE_ZIPAPP):
         sys.path.insert(0, UPDATE_ZIPAPP)
         try:
@@ -157,6 +180,10 @@ FFMPEG_URLS = [
 ]
 DENO_URL = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
 YTDLP_ZIPAPP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+YTDLP_SUMS_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS"
+YTDLP_LATEST_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+HISTORY_MAX = 500
 
 DEFAULT_CFG = {
     "folder": os.path.join(os.path.expanduser("~"), "Downloads"),
@@ -175,6 +202,8 @@ DEFAULT_CFG = {
     "overwrite": False,
     "theme": "Sistema",
     "auto_update": True,
+    "auto_ytdlp": True,
+    "notify": True,
 }
 
 # ---------------------------------------------------------------- paleta (claro, escuro)
@@ -378,8 +407,9 @@ def is_newer(latest, current):
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-def fetch_latest_release(repo, api=None, timeout=15):
+def fetch_latest_release(repo, api=None, timeout=15, base=None):
     """Consulta a última Release do repositório no GitHub."""
+    base = APP_BASE if base is None else base
     if not REPO_RE.match(repo or ""):
         raise ValueError("Repositório inválido: " + repr(repo))
     api = api or UPDATE_API
@@ -390,8 +420,17 @@ def fetch_latest_release(repo, api=None, timeout=15):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     tag = data.get("tag_name") or ""
-    asset = next((a for a in data.get("assets") or [] if str(a.get("name", "")).lower().endswith("setup.exe")), None)
+    assets = data.get("assets") or []
+    asset = next((a for a in assets if str(a.get("name", "")).lower().endswith("setup.exe")), None)
+    by_name = {str(a.get("name", "")): a for a in assets}
+    patch_name = f"VibeGrap-App-{base}.zip" if re.fullmatch(r"[0-9a-f]{6,64}", base or "") else None
+    patch = by_name.get(patch_name) if patch_name else None
+    patch_sha = by_name.get(patch_name + ".sha256") if patch else None
+    has_patch = bool(patch and patch_sha)
     return {
+        "patch_url": patch.get("browser_download_url") if has_patch else None,
+        "patch_size": patch.get("size") if has_patch else None,
+        "patch_sha_url": patch_sha.get("browser_download_url") if has_patch else None,
         "tag": tag,
         "version": tag.lstrip("vV"),
         "notes": (data.get("body") or "").strip(),
@@ -419,6 +458,132 @@ def download_update(info, dest, progress=None):
     return dest
 
 
+# ---------------------------------------------------------------- atualização leve (só o VibeGrap.exe + assets)
+def can_write_dir(folder):
+    try:
+        with tempfile.NamedTemporaryFile(dir=folder):
+            return True
+    except OSError:
+        return False
+
+
+def pick_update_mode(info, frozen=None, win=None, app_dir=None):
+    """'patch' (pacote leve), 'installer' (instalador completo) ou 'page' (abrir o navegador)."""
+    frozen = FROZEN if frozen is None else frozen
+    win = IS_WIN if win is None else win
+    if not (frozen and win):
+        return "page"
+    if info.get("patch_url") and info.get("patch_sha_url") and can_write_dir(app_dir or exe_dir()):
+        return "patch"
+    return "installer" if info.get("asset_url") else "page"
+
+
+def download_patch(info, dest, progress=None):
+    """Baixa o pacote leve e confere o tamanho e o SHA-256 publicado junto na Release."""
+    repo = info.get("repo", UPDATE_REPO)
+    if not (asset_url_ok(info.get("patch_url"), repo) and asset_url_ok(info.get("patch_sha_url"), repo)):
+        raise RuntimeError("Endereço da atualização não é confiável.")
+    req = urllib.request.Request(info["patch_sha_url"], headers={"User-Agent": "VibeGrap"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        text = resp.read(512).decode("ascii", "replace")
+    m = re.match(r"\s*([0-9a-fA-F]{64})", text)
+    if not m:
+        raise RuntimeError("Hash da atualização ausente ou inválido.")
+    download_file(info["patch_url"], dest, progress)
+    size = info.get("patch_size")
+    if (size and os.path.getsize(dest) != size) or sha256_file(dest) != m.group(1).lower():
+        os.remove(dest)
+        raise RuntimeError("A atualização baixada não confere (tamanho ou hash). Nada foi instalado.")
+    return dest
+
+
+def extract_patch(zip_path, stage_dir):
+    """Extrai o pacote leve numa pasta temporária, aceitando só os arquivos esperados."""
+    if os.path.isdir(stage_dir):
+        shutil.rmtree(stage_dir)
+    os.makedirs(stage_dir)
+    with zipfile.ZipFile(zip_path) as z:
+        members, total = [], 0
+        for i in z.infolist():
+            if i.is_dir():
+                continue
+            name = i.filename.replace("\\", "/")
+            parts = name.split("/")
+            if name.startswith("/") or ".." in parts or ":" in name or not (name in PATCH_FILES or name.startswith(PATCH_DIR)):
+                raise RuntimeError("Arquivo inesperado no pacote de atualização: " + name)
+            total += i.file_size
+            members.append((i, name))
+        if total > PATCH_MAX_BYTES or not any(n == PATCH_FILES[0] for _, n in members):
+            raise RuntimeError("Pacote de atualização inválido.")
+        for i, name in members:
+            dest = os.path.join(stage_dir, *name.split("/"))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(i) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+    with open(os.path.join(stage_dir, PATCH_FILES[0]), "rb") as f:
+        if f.read(2) != b"MZ":
+            raise RuntimeError("O VibeGrap.exe do pacote não é um executável válido.")
+    return stage_dir
+
+
+def apply_patch(stage, app_dir, exe_name="VibeGrap.exe"):
+    """Troca o .exe e os assets. O Windows deixa RENOMEAR um .exe em uso (mas não apagar): o antigo vira
+    .old e é apagado na próxima abertura. Qualquer falha desfaz tudo e devolve o programa como estava."""
+    exe = os.path.join(app_dir, exe_name)
+    old = exe + ".old"
+    assets_dst = os.path.join(app_dir, *PATCH_DIR.strip("/").split("/"))
+    backup = stage.rstrip("/\\") + "_rollback"
+    if os.path.exists(old):
+        os.remove(old)
+    if os.path.isdir(backup):
+        shutil.rmtree(backup)
+    if os.path.isdir(assets_dst):
+        shutil.copytree(assets_dst, backup)
+    os.replace(exe, old)
+    try:
+        shutil.copy2(os.path.join(stage, PATCH_FILES[0]), exe)
+        assets_src = os.path.join(stage, *PATCH_DIR.strip("/").split("/"))
+        if os.path.isdir(assets_src):
+            shutil.copytree(assets_src, assets_dst, dirs_exist_ok=True)
+        for extra in PATCH_FILES[1:]:
+            if os.path.isfile(os.path.join(stage, extra)):
+                try:
+                    shutil.copy2(os.path.join(stage, extra), os.path.join(app_dir, extra))
+                except OSError:
+                    pass  # licença não é crítica
+    except Exception:
+        try:
+            if os.path.exists(exe):
+                os.remove(exe)
+        except OSError:
+            pass
+        os.replace(old, exe)
+        if os.path.isdir(backup):
+            shutil.copytree(backup, assets_dst, dirs_exist_ok=True)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
+    return exe
+
+
+def cleanup_after_patch():
+    """Apaga restos de uma atualização leve anterior (o .exe antigo e a pasta temporária)."""
+    try:
+        if FROZEN:
+            old = sys.executable + ".old"
+            if os.path.exists(old):
+                os.remove(old)
+        shutil.rmtree(os.path.join(tempfile.gettempdir(), "vibegrap-update"), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def relaunch_app(exe, app_dir):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # o novo processo não herda o estado do antigo
+    flags = (0x00000008 | 0x00000200) if IS_WIN else 0  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([exe], cwd=app_dir, env=env, creationflags=flags, close_fds=True)
+
+
 def extract_from_zip(zip_path, wanted, require_bin_dir=False):
     """Extrai arquivos pelo nome base (evita 'zip slip'). Retorna os nomes extraídos."""
     found = []
@@ -431,6 +596,148 @@ def extract_from_zip(zip_path, wanted, require_bin_dir=False):
                     shutil.copyfileobj(src, dst)
                 found.append(base)
     return found
+
+
+# ---------------------------------------------------------------- erros em português
+# (padrão no texto do erro, mensagem para o usuário). A primeira regra que combinar vence.
+ERROR_RULES = [
+    (r"not a bot|confirm you.re not a bot",
+     "O YouTube pediu uma verificação anti-robô. Em Configurações, escolha o navegador em “Cookies do navegador” "
+     "(onde você está logado) e atualize o yt-dlp em Ferramentas."),
+    (r"confirm your age|age[- ]restricted|inappropriate for some users",
+     "Vídeo com restrição de idade. Em Configurações, escolha o navegador onde você está logado em “Cookies do navegador”."),
+    (r"private video|this video is private",
+     "Este vídeo é privado. Se ele é seu, escolha o navegador logado em Configurações → Cookies do navegador."),
+    (r"members[- ]only|join this channel|available to this channel.s members",
+     "Vídeo exclusivo para membros do canal. Use os cookies do navegador onde você é membro (Configurações)."),
+    (r"copyright",
+     "O vídeo foi bloqueado por direitos autorais e não pode ser baixado."),
+    (r"not available in your country|blocked it in your country|geo[- ]?restrict|not made this video available in your country",
+     "Este vídeo não está disponível na sua região. Um proxy/VPN (Configurações → Proxy) pode ajudar."),
+    (r"premieres? in|will begin in|live event will begin|this live event",
+     "A transmissão/estreia ainda não começou. Tente de novo mais tarde."),
+    (r"video unavailable|this video is (not available|unavailable)|has been removed|no longer available|account.*terminated|does not exist",
+     "O vídeo está indisponível ou foi removido."),
+    (r"sign in|log ?in required|login required|requires authentication|rate-limit reached",
+     "O site exige login para este conteúdo. Escolha o navegador logado em Configurações → Cookies do navegador."),
+    (r"unsupported url",
+     "Esse link não é suportado. Confira se é o endereço completo de um vídeo."),
+    (r"requested format is not available",
+     "A qualidade escolhida não existe para este vídeo. Experimente “Melhor disponível”."),
+    (r"http error 429|too many requests",
+     "O site limitou as requisições (muitos pedidos seguidos). Espere alguns minutos e tente de novo."),
+    (r"http error 403|forbidden",
+     "O site recusou o acesso (403). Atualize o yt-dlp em Ferramentas ou use os cookies do navegador."),
+    (r"http error 404|404 not found",
+     "O endereço não foi encontrado (404). Confira o link."),
+    (r"no space left|not enough space|errno 28|disk full",
+     "O disco está cheio. Libere espaço ou escolha outra pasta."),
+    (r"permission denied|errno 13|access is denied",
+     "Sem permissão para gravar nessa pasta. Escolha outra pasta de destino."),
+    (r"ffmpeg|ffprobe",
+     "O ffmpeg não foi encontrado ou falhou. Abra Ferramentas e use “Baixar / atualizar ffmpeg”."),
+    (r"js runtime|javascript runtime|n challenge|signature solving|no video formats found",
+     "O YouTube exige um runtime JavaScript. Abra Ferramentas e baixe o Deno; depois atualize o yt-dlp."),
+    (r"getaddrinfo|name or service not known|temporary failure in name resolution|network is unreachable|"
+     r"timed out|timeout|connection (reset|refused|aborted)|remote end closed|urlopen error|unable to download webpage|"
+     r"unable to connect|failed to resolve|ssl",
+     "Sem conexão com o site. Verifique sua internet (ou o proxy) e tente de novo."),
+]
+
+
+def clean_error(text):
+    """Remove cores do terminal e prefixos técnicos ('ERROR: ', '[youtube] abc:')."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", str(text or "")).strip()
+    text = re.sub(r"^(ERROR:\s*)+", "", text)
+    text = re.sub(r"^(?:\[[A-Za-z][\w:.-]*\]\s*(?:[\w-]+:\s+)?)+", "", text).strip()
+    return text
+
+
+def friendly_error(text):
+    """Traduz erros comuns do yt-dlp para uma frase clara em português."""
+    raw = clean_error(text)
+    for pattern, message in ERROR_RULES:
+        if re.search(pattern, raw, re.I):
+            return message
+    return short(raw, 220) if raw else "Falhou por um motivo desconhecido. Veja o Registro."
+
+
+# ---------------------------------------------------------------- histórico
+def load_history(path=None):
+    try:
+        with open(path or HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return [e for e in data if isinstance(e, dict) and e.get("url")] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(entries, path=None):
+    try:
+        with open(path or HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries[:HISTORY_MAX], f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def filter_history(entries, text):
+    t = (text or "").strip().lower()
+    if not t:
+        return list(entries)
+    return [e for e in entries if t in (e.get("title", "") + " " + e.get("url", "")).lower()]
+
+
+# ---------------------------------------------------------------- atualização do yt-dlp
+def ytdlp_latest_version(url=None, timeout=15):
+    req = urllib.request.Request(url or YTDLP_LATEST_API, headers={"User-Agent": "VibeGrap", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    tag = str(data.get("tag_name") or "").lstrip("vV")
+    if not tag:
+        raise RuntimeError("Resposta sem número de versão.")
+    return tag
+
+
+def expected_sha256(sums_url=None, name="yt-dlp", timeout=20):
+    """Lê o arquivo SHA2-256SUMS oficial e devolve o hash esperado do arquivo 'name'."""
+    req = urllib.request.Request(sums_url or YTDLP_SUMS_URL, headers={"User-Agent": "VibeGrap"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", "replace")
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == name and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            return parts[0].lower()
+    raise RuntimeError("Não achei o hash oficial do yt-dlp.")
+
+
+def sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stage_ytdlp_update(progress=None, url=None, sums_url=None, dest=None):
+    """Baixa o yt-dlp novo, confere o hash oficial e deixa em 'yt-dlp.new' (entra em uso na próxima abertura)."""
+    dest = dest or UPDATE_ZIPAPP + ".new"
+    tmp = dest + ".part"
+    try:
+        want = expected_sha256(sums_url)  # sem o hash oficial, não instala
+        download_file(url or YTDLP_ZIPAPP_URL, tmp, progress)
+        if sha256_file(tmp) != want:
+            raise RuntimeError("O arquivo baixado não confere com o hash oficial. Nada foi instalado.")
+        if not zipfile.is_zipfile(tmp) or "yt_dlp/__init__.py" not in zipfile.ZipFile(tmp).namelist():
+            raise RuntimeError("Arquivo de atualização inválido.")
+        os.replace(tmp, dest)
+        return dest
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def open_folder(path):
@@ -685,6 +992,10 @@ class App(ctk.CTk):
         self.nav = {}
         self.update_info = None
         self.upd_win = None
+        self.toast_win = None
+        self.history = load_history()
+        self.hist_dirty = True       # a lista só é redesenhada quando a aba Histórico está aberta
+        self.current_page = "download"
 
         self._make_vars()
         self._build()
@@ -694,6 +1005,8 @@ class App(ctk.CTk):
         self.after(80, self._pump)
         self.after(500, self._startup_check)
         self.after(3000, self._startup_update_check)
+        self.after(7000, self._startup_ytdlp_check)
+        self.after(5000, cleanup_after_patch)
 
     # ------------------------------------------------------------ ícone
     def _set_icon(self):
@@ -735,6 +1048,9 @@ class App(ctk.CTk):
         self.v_overwrite = tk.BooleanVar(value=c["overwrite"])
         self.v_theme = tk.StringVar(value=c["theme"] if c["theme"] in THEMES else "Sistema")
         self.v_autoupdate = tk.BooleanVar(value=c["auto_update"])
+        self.v_auto_ytdlp = tk.BooleanVar(value=c["auto_ytdlp"])
+        self.v_notify = tk.BooleanVar(value=c["notify"])
+        self.v_hsearch = tk.StringVar()
         self.v_status = tk.StringVar(value="Pronto.")
         self.v_audio_hint = tk.StringVar(value="Analise um link para listar as faixas de áudio disponíveis.")
         self.v_tools = tk.StringVar()
@@ -756,6 +1072,7 @@ class App(ctk.CTk):
         stack.rowconfigure(0, weight=1)
         self.pages["download"] = self._page_download(stack)
         self.pages["queue"] = self._page_queue(stack)
+        self.pages["history"] = self._page_history(stack)
         self.pages["settings"] = self._page_settings(stack)
         self.pages["tools"] = self._page_tools(stack)
         self.pages["log"] = self._page_log(stack)
@@ -786,6 +1103,7 @@ class App(ctk.CTk):
         items = [
             ("download", "Novo download"),
             ("queue", "Fila"),
+            ("history", "Histórico"),
             ("settings", "Configurações"),
             ("tools", "Ferramentas"),
             ("log", "Registro"),
@@ -810,6 +1128,9 @@ class App(ctk.CTk):
 
     def _show(self, name):
         self.pages[name].tkraise()
+        self.current_page = name
+        if name == "history" and self.hist_dirty:
+            self._render_history()
         for key, b in self.nav.items():
             active = key == name
             b.configure(fg_color=SOFT if active else "transparent")
@@ -1029,6 +1350,154 @@ class App(ctk.CTk):
         self.qframe.pack(fill="both", expand=True)
         return page
 
+    # ------------------------------------------------------------ página: histórico
+    def _page_history(self, parent):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap = ctk.CTkFrame(page, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=28, pady=(18, 0))
+        self._header(wrap, "Histórico", "O que você já baixou. Fica salvo mesmo depois de fechar o programa.")
+        bar = ctk.CTkFrame(wrap, fg_color="transparent")
+        bar.pack(fill="x", pady=(0, 8))
+        self.ent_hsearch = entry(bar, self.v_hsearch, placeholder_text="Buscar por título ou link…")
+        self.ent_hsearch.pack(side="left", fill="x", expand=True)
+        btn(bar, "Limpar histórico", self._clear_history, "soft", width=150).pack(side="left", padx=(8, 0))
+        self.v_hsearch.trace_add("write", lambda *_: self._render_history())
+        self.lbl_hempty = lbl(wrap, "", muted=True)
+        self.lbl_hempty.pack(pady=(10, 0))
+        self.hframe = ctk.CTkScrollableFrame(wrap, fg_color="transparent", corner_radius=0)
+        self.hframe.pack(fill="both", expand=True)
+        self._render_history()
+        return page
+
+    def _render_history(self):
+        self.hist_dirty = False
+        for w in self.hframe.winfo_children():
+            w.destroy()
+        rows = filter_history(self.history, self.v_hsearch.get())
+        self.nav["history"].configure(text="Histórico")
+        if not rows:
+            self.lbl_hempty.configure(
+                text="Nada encontrado." if self.history else "Ainda não há downloads no histórico."
+            )
+            return
+        self.lbl_hempty.configure(text="")
+        for e in rows[:100]:
+            r = ctk.CTkFrame(self.hframe, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
+            r.pack(fill="x", pady=5, padx=2)
+            r.columnconfigure(0, weight=1)
+            lbl(r, short(e.get("title") or e["url"]), bold=True, size=14, anchor="w", justify="left").grid(
+                row=0, column=0, sticky="ew", padx=14, pady=(10, 0))
+            ok = e.get("status") != "Erro"
+            info = " · ".join(x for x in (e.get("date", ""), fmt_size(e["size"]) if e.get("size") else "", e.get("status", "")) if x)
+            l2 = lbl(r, info, muted=True, size=12, anchor="w")
+            if not ok:
+                l2.configure(text_color=RED)
+            l2.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+            acts = ctk.CTkFrame(r, fg_color="transparent")
+            acts.grid(row=0, column=1, rowspan=2, padx=10)
+            btn(acts, "Abrir pasta", lambda f=e.get("folder", ""): open_folder(f), "soft", width=100).pack(side="left", padx=3)
+            btn(acts, "Copiar link", lambda u=e["url"]: self._copy_text(u), "soft", width=100).pack(side="left", padx=3)
+            btn(acts, "Usar de novo", lambda u=e["url"]: self._reuse_url(u), "soft", width=110).pack(side="left", padx=3)
+        if len(rows) > 100:
+            lbl(self.hframe, f"Mostrando 100 de {len(rows)}. Use a busca para achar os outros.", muted=True, size=12).pack(pady=8)
+
+    def _copy_text(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.v_status.set("Link copiado.")
+
+    def _reuse_url(self, url):
+        self.ent_url.delete(0, "end")
+        self.ent_url.insert(0, url)
+        self._show("download")
+
+    def _clear_history(self):
+        if self.history and messagebox.askyesno("Limpar histórico", "Apagar todo o histórico? Os arquivos baixados não são apagados."):
+            self.history = []
+            save_history([])
+            self._render_history()
+
+    def _record_history(self, it, status):
+        size = it.get("done") or 0
+        entry = {
+            "title": re.sub(r"^\[Playlist\]\s*", "", it.get("title") or ""),
+            "url": it["url"],
+            "folder": (it.get("opts", {}).get("paths") or {}).get("home", ""),
+            "size": int(size),
+            "status": status,
+            "date": time.strftime("%d/%m/%Y %H:%M"),
+        }
+        self.history.insert(0, entry)
+        del self.history[HISTORY_MAX:]
+        save_history(self.history)
+        self.hist_dirty = True
+        if self.current_page == "history":
+            self._render_history()
+
+    # ------------------------------------------------------------ aviso ao terminar
+    def _should_notify(self):
+        try:
+            return self.state() == "iconic" or self.focus_displayof() is None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _toast(self, title, text, ms=8000):
+        """Pequeno aviso no canto da tela (funciona em qualquer sistema, sem depender de nada extra)."""
+        try:
+            if self.toast_win is not None and self.toast_win.winfo_exists():
+                self.toast_win.destroy()
+            t = self.toast_win = ctk.CTkToplevel(self, fg_color=BG)
+            t.overrideredirect(True)
+            t.attributes("-topmost", True)
+            box = ctk.CTkFrame(t, fg_color=CARD, border_width=2, border_color=ACCENT, corner_radius=12)
+            box.pack(fill="both", expand=True)
+            lbl(box, title, bold=True, size=14).pack(anchor="w", padx=16, pady=(12, 0))
+            ctk.CTkLabel(box, text=text, text_color=MUTED, justify="left", anchor="w", wraplength=300,
+                         font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(2, 12))
+            t.update_idletasks()
+            w, h = max(t.winfo_reqwidth(), 340), t.winfo_reqheight()
+            t.geometry(f"{w}x{h}+{self.winfo_screenwidth() - w - 24}+{self.winfo_screenheight() - h - 72}")
+
+            def open_app(_e=None):
+                t.destroy()
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+
+            for widget in (t, box, *box.winfo_children()):
+                widget.bind("<Button-1>", open_app)
+            t.after(ms, lambda: t.winfo_exists() and t.destroy())
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------ atualização automática do yt-dlp
+    def _startup_ytdlp_check(self):
+        if self.v_auto_ytdlp.get() and FROZEN:
+            threading.Thread(target=self._ytdlp_auto_worker, daemon=True).start()
+
+    def _ytdlp_auto_worker(self):
+        try:
+            latest = ytdlp_latest_version()
+            if not is_newer(latest, YTDLP_VERSION):
+                self.q.put(("ytdlp", "uptodate", latest))
+                return
+            if os.path.isfile(UPDATE_ZIPAPP + ".new"):
+                return  # já há uma atualização esperando a próxima abertura
+            stage_ytdlp_update()
+            self.q.put(("ytdlp", "staged", latest))
+        except Exception as exc:  # noqa: BLE001
+            self.q.put(("ytdlp", "error", str(exc)))
+
+    def _on_ytdlp_msg(self, msg):
+        kind, val = msg[1], msg[2]
+        if kind == "staged":
+            self._log(f"yt-dlp {val} baixado e verificado. Entra em uso na próxima vez que abrir o programa.")
+            self.v_status.set(f"yt-dlp {val} pronto: será usado na próxima abertura.")
+        elif kind == "uptodate":
+            self._log(f"yt-dlp está em dia ({YTDLP_VERSION}).")
+        else:
+            self._log(f"Não consegui verificar/atualizar o yt-dlp agora: {val}")
+
     # ------------------------------------------------------------ página: configurações
     def _page_settings(self, parent):
         page = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1075,6 +1544,8 @@ class App(ctk.CTk):
         switch(s, "Embutir miniatura (capa) no arquivo", self.v_thumb).pack(anchor="w", pady=5)
         switch(s, "Sobrescrever arquivos já existentes", self.v_overwrite).pack(anchor="w", pady=5)
         switch(s, "Verificar se há versão nova do programa ao abrir", self.v_autoupdate).pack(anchor="w", pady=5)
+        switch(s, "Manter o yt-dlp atualizado sozinho (confere o hash oficial)", self.v_auto_ytdlp).pack(anchor="w", pady=5)
+        switch(s, "Avisar quando os downloads terminarem (com o programa em segundo plano)", self.v_notify).pack(anchor="w", pady=5)
         return page
 
     # ------------------------------------------------------------ página: ferramentas
@@ -1240,6 +1711,7 @@ class App(ctk.CTk):
             playlist_folder=self.v_plfolder.get(), browser=self.v_browser.get(), cookiefile=self.v_cookiefile.get(),
             proxy=self.v_proxy.get(), limit=self.v_limit.get(), meta=self.v_meta.get(), thumb=self.v_thumb.get(),
             overwrite=self.v_overwrite.get(), theme=self.v_theme.get(), auto_update=self.v_autoupdate.get(),
+            auto_ytdlp=self.v_auto_ytdlp.get(), notify=self.v_notify.get(),
         )
         save_settings(self.cfg)
 
@@ -1703,7 +2175,7 @@ class App(ctk.CTk):
                     code = ydl.download([item["url"]])
                 if code:
                     item["status"] = "Concluído com avisos" if item.get("playlist") else "Erro"
-                    error = "O yt-dlp terminou com erro. Veja o Registro."
+                    error = "O yt-dlp terminou com erro. Veja o Registro para os detalhes."
                 else:
                     item["status"] = "Concluído"
                 if item["status"] == "Erro":
@@ -1718,8 +2190,9 @@ class App(ctk.CTk):
                 else:
                     item["status"] = "Erro"
                     failed += 1
-                    error = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
-                    self.q.put(("log", f"Falhou: {error}"))
+                    raw = clean_error(exc)
+                    error = friendly_error(raw)
+                    self.q.put(("log", f"Falhou: {raw}"))
             self.q.put(("state", iid, item["status"], error))
         self.q.put(("fim", ok, failed))
 
@@ -1832,9 +2305,11 @@ class App(ctk.CTk):
             row.set_progress(1.0)
             if it["done"]:
                 row.set_size(fmt_size(it["done"]))
+            self._record_history(it, status)
         elif status == "Erro":
             row.set_state("Erro", RED)
             row.set_error(extra or "Falhou. Veja o Registro.")
+            self._record_history(it, status)
         elif status == "Cancelado":
             row.set_state("Cancelado")
         row.btn_x.configure(state="disabled" if status == "Baixando" else "normal")
@@ -1910,7 +2385,10 @@ class App(ctk.CTk):
                         hint = ""
                         if "youtu" in msg[1] and not detect_js_runtime():
                             hint = "\n\nDica: o YouTube exige um runtime JavaScript (Deno). Abra Ferramentas e instale."
-                        messagebox.showerror("Não foi possível analisar", msg[2][:600] + hint)
+                        messagebox.showerror(
+                            "Não foi possível analisar",
+                            friendly_error(msg[2]) + hint + "\n\nDetalhe técnico:\n" + clean_error(msg[2])[:300],
+                        )
                     elif kind == "thumb":
                         if self.info and self.info.get("thumbnail") == msg[1]:
                             self._set_thumb(msg[2])
@@ -1923,6 +2401,8 @@ class App(ctk.CTk):
                         self._on_update_result(msg[1], msg[2], msg[3])
                     elif kind == "upd":
                         self._on_upd_msg(msg)
+                    elif kind == "ytdlp":
+                        self._on_ytdlp_msg(msg)
                 except Exception as exc:  # noqa: BLE001
                     self._log(f"(erro interno na interface: {exc})")
         except queue.Empty:
@@ -1945,6 +2425,11 @@ class App(ctk.CTk):
             self.v_status.set(f"Concluído: {ok} com sucesso, {failed} com erro  ·  {fmt_size(done_b)} baixados")
             if ok or failed:
                 self.bell()
+                if self.v_notify.get() and self._should_notify():
+                    self._toast(
+                        "Downloads terminados" if not failed else "Downloads terminaram com erros",
+                        f"{ok} com sucesso, {failed} com erro  ·  {fmt_size(done_b)} baixados",
+                    )
         self.stat["speed"].configure(text="—")
         self.stat["eta"].configure(text="—")
 
@@ -2020,7 +2505,15 @@ class App(ctk.CTk):
             return
         notes = short(info["notes"], 500) if info["notes"] else "(sem notas)"
         head = f"Versão instalada: v{APP_VERSION}\nNova versão: v{info['version']}\n\nNovidades:\n{notes}\n\n"
-        if IS_WIN and FROZEN and info.get("asset_url"):
+        mode = pick_update_mode(info)
+        if mode == "patch":
+            size = f" (~{fmt_size(info['patch_size'])})" if info.get("patch_size") else ""
+            if messagebox.askyesno(
+                f"Nova versão v{info['version']}",
+                head + f"Baixar só o que mudou{size} e atualizar agora? O programa fecha e abre de novo sozinho.",
+            ):
+                self._do_update(info)
+        elif mode == "installer":
             if messagebox.askyesno(
                 f"Nova versão v{info['version']}",
                 head + "Baixar e instalar agora? O programa fecha e abre de novo sozinho.",
@@ -2047,6 +2540,18 @@ class App(ctk.CTk):
         try:
             folder = os.path.join(tempfile.gettempdir(), "vibegrap-update")
             os.makedirs(folder, exist_ok=True)
+            if pick_update_mode(info) == "patch":
+                try:  # atualização leve; se qualquer etapa falhar, cai no instalador completo
+                    zp = os.path.join(folder, "VibeGrap-App.zip")
+                    download_patch(info, zp, lambda pct: self.q.put(("upd", "pct", pct)))
+                    stage = extract_patch(zp, os.path.join(folder, "patch"))
+                    exe = apply_patch(stage, exe_dir(), os.path.basename(sys.executable))
+                    self.q.put(("upd", "done", exe, None, "patch"))
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    if not info.get("asset_url"):
+                        raise
+                    self.q.put(("upd", "txt", "A atualização leve não deu certo. Baixando o instalador completo…"))
             dest = os.path.join(folder, "VibeGrap-Setup.exe")
             download_update(info, dest, lambda pct: self.q.put(("upd", "pct", pct)))
             self.q.put(("upd", "done", dest, None))
@@ -2054,6 +2559,10 @@ class App(ctk.CTk):
             self.q.put(("upd", "done", None, str(exc)))
 
     def _on_upd_msg(self, msg):
+        if msg[1] == "txt":
+            if self.upd_win is not None and self.upd_win.winfo_exists():
+                self.upd_msg.configure(text=msg[2])
+            return
         if msg[1] == "pct":
             if self.upd_win is not None and self.upd_win.winfo_exists():
                 self.upd_bar.set(msg[2] / 100)
@@ -2068,6 +2577,11 @@ class App(ctk.CTk):
                 "Não foi possível baixar a atualização:\n" + short(error or "", 200) + "\n\nAbrir a página de download no navegador?",
             ) and self.update_info:
                 webbrowser.open(self.update_info["page"])
+            return
+        if len(msg) > 4 and msg[4] == "patch":
+            self.upd_msg.configure(text="Pronto! Reiniciando o programa…")
+            relaunch_app(path, exe_dir())
+            self.after(500, self._quit_for_update)
             return
         self.upd_msg.configure(text="Abrindo o instalador… o programa vai fechar e abrir de novo.")
         self._launch_installer(path)
@@ -2171,10 +2685,7 @@ class App(ctk.CTk):
                 if not names:
                     raise RuntimeError("deno.exe não encontrado no arquivo baixado.")
             else:
-                download_file(YTDLP_ZIPAPP_URL, tmp, progress)
-                if not zipfile.is_zipfile(tmp) or "yt_dlp/__init__.py" not in zipfile.ZipFile(tmp).namelist():
-                    raise RuntimeError("Arquivo de atualização inválido.")
-                os.replace(tmp, UPDATE_ZIPAPP)
+                stage_ytdlp_update(progress)
             if os.path.exists(tmp):
                 os.remove(tmp)
             self.q.put(("tool", "done", "Concluído!" + (" Reinicie o programa para usar a nova versão do yt-dlp." if which == "ytdlp" else "")))
