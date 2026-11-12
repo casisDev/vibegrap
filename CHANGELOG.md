@@ -1,5 +1,9 @@
 # Histórico de versões
 
+## [2.1.1]
+
+- Mudança do logo e icone
+
 ## [2.1.0]
 
 - Atualização leve: o botão de atualizar baixa só o que mudou (pacote pequeno, conferido por hash) em vez do instalador inteiro.
