@@ -584,6 +584,49 @@ def relaunch_app(exe, app_dir):
     subprocess.Popen([exe], cwd=app_dir, env=env, creationflags=flags, close_fds=True)
 
 
+def parse_item_ranges(text, total):
+    """Lê '1-10, 15, 20-' e devolve (itens ordenados, problemas). Aceita 1-10, 1:10, 5- (até o fim) e -3 (do início)."""
+    text = re.sub(r"\s*([-:–])\s*", r"\1", (text or "").strip())
+    picked, problems = set(), []
+    for tok in filter(None, re.split(r"[,;\s]+", text)):
+        m = re.fullmatch(r"(\d*)[-:–](\d*)", tok)
+        if m and (m.group(1) or m.group(2)):
+            a = int(m.group(1)) if m.group(1) else 1
+            b = int(m.group(2)) if m.group(2) else total
+        elif tok.isdigit():
+            a = b = int(tok)
+        else:
+            problems.append(f"“{tok}” não é um item nem um intervalo")
+            continue
+        if a > b:
+            a, b = b, a
+        if a < 1 or a > total:
+            problems.append(f"“{tok}” está fora da playlist (1 a {total})")
+            continue
+        picked.update(range(a, min(b, total) + 1))
+    return sorted(picked), problems
+
+
+def compress_items(nums):
+    """[1,2,3,5,7,8] -> '1-3,5,7-8' (formato do --playlist-items do yt-dlp)."""
+    out, nums = [], sorted(set(nums))
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def trimmed_logo(path):
+    """Abre o logo e corta a margem vazia, para ele aparecer grande e sem distorção."""
+    img = Image.open(path).convert("RGBA")
+    box = img.convert("L").point(lambda v: 255 if v > 40 else 0).getbbox()
+    return img.crop(box) if box else img
+
+
 def extract_from_zip(zip_path, wanted, require_bin_dir=False):
     """Extrai arquivos pelo nome base (evita 'zip slip'). Retorna os nomes extraídos."""
     found = []
@@ -907,6 +950,14 @@ class PickList(ctk.CTkFrame):
         self.lb.select_clear(0, "end")
         self.lb.event_generate("<<ListboxSelect>>")
 
+    def set_selected(self, indexes):
+        self.lb.select_clear(0, "end")
+        for i in indexes:
+            self.lb.select_set(i)
+        if indexes:
+            self.lb.see(min(indexes))
+        self.lb.event_generate("<<ListboxSelect>>")
+
     def get_all(self):
         return self.lb.get(0, "end")
 
@@ -1015,6 +1066,12 @@ class App(ctk.CTk):
             if IS_WIN and os.path.isfile(ico):
                 # o customtkinter redefine o ícone logo após abrir a janela; reaplicamos depois
                 self.after(250, lambda: self.iconbitmap(ico))
+            elif Image is not None and os.path.isfile(ico):
+                from PIL import ImageTk
+                im = Image.open(ico)
+                im.size = max(im.info.get("sizes") or [im.size])
+                self._icon_photo = ImageTk.PhotoImage(im.convert("RGBA"))
+                self.iconphoto(True, self._icon_photo)
             elif os.path.isfile(png):
                 self.iconphoto(True, tk.PhotoImage(file=png))
         except Exception:
@@ -1025,6 +1082,8 @@ class App(ctk.CTk):
         c = self.cfg
         self.v_folder = tk.StringVar(value=c["folder"])
         self.v_mode = tk.StringVar(value=c["mode"])
+        self.v_plaudio = tk.BooleanVar(value=c["mode"] == "audio")  # atalho "só áudio" da aba Playlist
+        self.v_plrange = tk.StringVar(value="")
         self.v_quality = tk.StringVar(value=BEST)
         self.v_container = tk.StringVar(value=c["container"])
         self.v_afmt = tk.StringVar(value=c["audio_fmt"])
@@ -1089,16 +1148,21 @@ class App(ctk.CTk):
         head = ctk.CTkFrame(side, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=18, pady=(22, 18))
         logo = resource_path("assets/VibeGrap_logo.png")
+        logo_ok = False
         if Image is not None and os.path.isfile(logo):
             try:  # o logo é opcional: se algo falhar com imagens, o app abre mesmo assim
-                self.logo_img = ctk.CTkImage(Image.open(logo), size=(38, 38))
-                ctk.CTkLabel(head, image=self.logo_img, text="").pack(side="left")
+                img = trimmed_logo(logo)
+                w = 172  # largura útil da barra lateral; a altura segue a proporção do logo (sem distorcer)
+                self.logo_img = ctk.CTkImage(img, size=(w, max(1, round(w * img.height / img.width))))
+                card = ctk.CTkFrame(head, fg_color="#000000", corner_radius=14)  # faixa preta: o logo é branco/vermelho
+                card.pack(fill="x")
+                ctk.CTkLabel(card, image=self.logo_img, text="").pack(padx=10, pady=10)
+                logo_ok = True
             except Exception:
                 pass
-        col = ctk.CTkFrame(head, fg_color="transparent")
-        col.pack(side="left", padx=10)
-        lbl(col, "VibeGrap", bold=True, size=17).pack(anchor="w")
-        lbl(col, "Downloader", muted=True, size=12).pack(anchor="w")
+        if not logo_ok:
+            lbl(head, "VibeGrap", bold=True, size=17).pack(anchor="w")
+            lbl(head, "Downloader", muted=True, size=12).pack(anchor="w")
 
         items = [
             ("download", "Novo download"),
@@ -1241,7 +1305,7 @@ class App(ctk.CTk):
         c = card(wrap)
         c.pack(fill="x", pady=6)
         self.tabs = ctk.CTkTabview(
-            c, height=310, corner_radius=12, fg_color="transparent",
+            c, height=356, corner_radius=12, fg_color="transparent",
             segmented_button_selected_color=SEL, segmented_button_selected_hover_color=SEL_H,
             segmented_button_unselected_color=SOFT, segmented_button_unselected_hover_color=SOFT_H,
             text_color=TXT,
@@ -1309,16 +1373,31 @@ class App(ctk.CTk):
         switch(side, "Manter também o arquivo .srt", self.v_sub_keep).pack(anchor="w", pady=3)
 
     def _tab_playlist(self, tab):
+        rng = ctk.CTkFrame(tab, fg_color="transparent")
+        rng.pack(fill="x", pady=(6, 0))
+        lbl(rng, "Itens", muted=True).pack(side="left")
+        self.ent_plrange = entry(rng, self.v_plrange, width=230, placeholder_text="ex.: 1-10, 15, 20-25")
+        self.ent_plrange.pack(side="left", padx=(8, 8))
+        self.ent_plrange.bind("<Return>", lambda _e: self._pl_apply())
+        btn(rng, "Aplicar", self._pl_apply, "soft", width=90).pack(side="left")
+        self.lbl_plcount = lbl(rng, "", muted=True, size=12)
+        self.lbl_plcount.pack(side="left", padx=12)
+
         row = ctk.CTkFrame(tab, fg_color="transparent")
         row.pack(fill="x", pady=(6, 8))
         row.columnconfigure(0, weight=1)
-        self.pl_items = PickList(row, height=5)
+        self.pl_items = PickList(row, height=4, on_change=self._pl_count)
         self.lists.append(self.pl_items)
         self.pl_items.grid(row=0, column=0, sticky="ew")
         side = ctk.CTkFrame(row, fg_color="transparent")
         side.grid(row=0, column=1, sticky="n", padx=(14, 0))
         btn(side, "Selecionar tudo", self.pl_items.select_all, "soft", width=150).pack(pady=(0, 6))
         btn(side, "Limpar seleção", self.pl_items.select_none, "soft", width=150).pack()
+
+        sw = ctk.CTkFrame(tab, fg_color="transparent")
+        sw.pack(fill="x", pady=(0, 10))
+        switch(sw, "Extrair só o áudio de todos os itens", self.v_plaudio, self._on_pl_audio).pack(side="left")
+        lbl(sw, "usa o formato e a qualidade da aba “Formato e áudio”", muted=True, size=12).pack(side="left", padx=12)
 
         lbl(tab, "Baixar só um trecho (vídeo único)", bold=True).pack(anchor="w", pady=(4, 2))
         cut = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1644,8 +1723,41 @@ class App(ctk.CTk):
 
     def _on_seg(self, label):
         self.v_mode.set(MODE_LABELS[label])
+        self.v_plaudio.set(self.v_mode.get() == "audio")
+        self.seg_mode.set(label)
         self._on_mode()
         self._update_estimate()
+
+    def _on_pl_audio(self):
+        label = "Só áudio" if self.v_plaudio.get() else "Vídeo + áudio"
+        self.seg_mode.set(label)
+        self._on_seg(label)
+
+    def _pl_count(self):
+        total = len(self.pl_index)
+        if total:
+            self.lbl_plcount.configure(text=f"{len(self.pl_items.selected())} de {total} selecionados", text_color=MUTED)
+        else:
+            self.lbl_plcount.configure(text="", text_color=MUTED)
+
+    def _pl_apply(self):
+        """Marca na lista os itens digitados (1-10, 15, 20-)."""
+        if not self.pl_index:
+            self.lbl_plcount.configure(text="Analise uma playlist primeiro.", text_color=RED)
+            return
+        text = self.v_plrange.get().strip()
+        if not text:
+            self.pl_items.select_all()
+            self._pl_count()
+            return
+        nums, problems = parse_item_ranges(text, max(self.pl_index))
+        where = {pos: i for i, pos in enumerate(self.pl_index)}
+        self.pl_items.set_selected([where[n] for n in nums if n in where])
+        self._pl_count()
+        if problems:
+            self.lbl_plcount.configure(text="; ".join(problems[:2]), text_color=RED)
+        elif not nums:
+            self.lbl_plcount.configure(text="Nenhum item encontrado nesse intervalo.", text_color=RED)
 
     def _on_mode(self):
         audio = self.v_mode.get() == "audio"
@@ -1804,6 +1916,7 @@ class App(ctk.CTk):
         self.pl_subs.clear()
         self.pl_items.clear()
         self.audio_langs, self.sub_items, self.pl_index = [], [], []
+        self._pl_count()
         self.lbl_thumb.configure(image=None, text="Sem\nminiatura")
         self.thumb_img = None
         thumb = info.get("thumbnail")
@@ -1878,7 +1991,9 @@ class App(ctk.CTk):
             self.pl_index.append(pos)
             labels.append(f"{pos:>3}. {title}")
         self.pl_items.set(labels)
+        self.v_plrange.set("")
         self.pl_items.select_all()
+        self._pl_count()
         self.v_audio_hint.set("Playlist: use o campo de idioma preferido abaixo (vale para todos os vídeos).")
         self.lbl_title.configure(text=short("Playlist: " + (info.get("title") or "(sem título)"), 140))
         self.lbl_meta.configure(text=f"{len(self.pl_index)} itens  ·  escolha quais baixar na aba “Playlist e trecho”")
@@ -1949,7 +2064,7 @@ class App(ctk.CTk):
                     messagebox.showwarning("Atenção", "Selecione pelo menos um item da playlist.")
                     return None
                 if len(sel) < len(self.pl_index):
-                    opts["playlist_items"] = ",".join(str(i) for i in sel)
+                    opts["playlist_items"] = compress_items(sel)
 
         pps = []
         notes = []

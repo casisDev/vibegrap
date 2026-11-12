@@ -1,5 +1,11 @@
 # Histórico de versões
 
+## [2.2.0]
+
+- Playlists: digite os itens que quer baixar, como `1-10`, `1, 2, 3` ou `1-5, 8, 12-`. Eles são marcados na lista e você ainda pode ajustar com o clique.
+- Interruptor "Extrair só o áudio de todos os itens" na aba Playlist, para baixar a playlist como áudio em lote.
+- Mostra quantos itens estão selecionados e avisa quando um número está fora da playlist.
+
 ## [2.1.1]
 
 - Mudança do logo e icone
