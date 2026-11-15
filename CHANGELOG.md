@@ -1,5 +1,12 @@
 # Histórico de versões
 
+## [2.2.1]
+
+- Corrigido: com "Pasta própria para playlists" ligado, os vídeos da playlist agora vão para uma subpasta com o nome dela (antes o nome virava `Lista⧸Vídeo.mp4`, tudo solto na pasta de destino).
+- Histórico bem mais rápido: a lista aparece em lotes de 12 itens, com o botão "Mostrar mais", em vez de montar tudo de uma vez.
+- As abas são montadas só quando abertas: o programa abre mais rápido e trocar de aba ficou mais leve.
+- Com a janela minimizada nada é redesenhado; a fila e o histórico se atualizam de uma vez quando você volta.
+
 ## [2.2.0]
 
 - Playlists: digite os itens que quer baixar, como `1-10`, `1, 2, 3` ou `1-5, 8, 12-`. Eles são marcados na lista e você ainda pode ajustar com o clique.

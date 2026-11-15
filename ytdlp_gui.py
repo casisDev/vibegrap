@@ -155,6 +155,20 @@ TEMPLATES = {
     "Canal - Título": "%(uploader)s - %(title)s.%(ext)s",
     "Nº - Título (playlists)": "%(playlist_index&{} - |)s%(title)s.%(ext)s",
 }
+
+
+def build_outtmpl(template, playlist_folder=False, is_playlist=False):
+    """Modelo do nome do arquivo, já com a subpasta da playlist quando for o caso.
+
+    A pasta é decidida aqui, e não com o "&" dentro do modelo, porque o yt-dlp sanitiza
+    a barra desse trecho e ela virava um "⧸" no meio do nome do arquivo (tudo ficava
+    solto na pasta de destino)."""
+    tpl = TEMPLATES.get(template, TEMPLATES["Título"])
+    if playlist_folder and is_playlist:
+        tpl = "%(playlist_title|Playlist)s/" + tpl
+    return tpl
+
+
 BROWSERS = ["Nenhum", "chrome", "firefox", "edge", "brave", "opera", "vivaldi", "chromium", "safari"]
 CONTAINERS = ["mp4", "mkv", "webm"]
 AUDIO_FORMATS = ["mp3", "m4a", "opus", "flac", "wav", "original"]
@@ -184,6 +198,8 @@ YTDLP_SUMS_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2
 YTDLP_LATEST_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 HISTORY_MAX = 500
+HISTORY_BATCH = 12      # itens desenhados por vez: cada cartão do histórico tem vários widgets
+HISTORY_SHOWN_MAX = 100  # limite da lista na tela; a busca encontra o resto
 
 DEFAULT_CFG = {
     "folder": os.path.join(os.path.expanduser("~"), "Downloads"),
@@ -826,12 +842,25 @@ def card(parent, **kw):
     return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER, **kw)
 
 
+_FONTS = {}
+
+
+def font(size=13, bold=False, family=None):
+    """Fonte compartilhada. Criar uma CTkFont nova em cada rótulo custa caro e deixa
+    as listas longas (histórico) lentas para desenhar."""
+    key = (size, bool(bold), family)
+    f = _FONTS.get(key)
+    if f is None:
+        f = _FONTS[key] = ctk.CTkFont(size=size, weight="bold" if bold else "normal", **({"family": family} if family else {}))
+    return f
+
+
 def lbl(parent, text="", muted=False, size=13, bold=False, **kw):
     return ctk.CTkLabel(
         parent,
         text=text,
         text_color=MUTED if muted else TXT,
-        font=ctk.CTkFont(size=size, weight="bold" if bold else "normal"),
+        font=font(size, bold),
         **kw,
     )
 
@@ -986,10 +1015,17 @@ class QueueRow(ctk.CTkFrame):
         self.bar.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(8, 12))
 
     def set_title(self, text):
-        self.lbl_title.configure(text=short(text))
+        text = short(text)
+        if text != getattr(self, "_title", None):
+            self._title = text
+            self.lbl_title.configure(text=text)
 
     def set_state(self, text, color=None):
-        self.lbl_state.configure(text=text, text_color=color or MUTED)
+        color = color or MUTED
+        key = (text, color)
+        if key != getattr(self, "_state", None):  # o mesmo texto a cada 80 ms custa caro à toa
+            self._state = key
+            self.lbl_state.configure(text=text, text_color=color)
 
     def set_progress(self, frac):
         frac = max(0.0, min(1.0, frac))
@@ -997,13 +1033,24 @@ class QueueRow(ctk.CTkFrame):
         if empty != getattr(self, "_empty", None):  # evita a "pontinha" azul da barra vazia
             self._empty = empty
             self.bar.configure(progress_color=FIELD if empty else ACCENT)
-        self.bar.set(frac)
+        if abs(frac - getattr(self, "_frac", -1.0)) >= 0.001:
+            self._frac = frac
+            self.bar.set(frac)
 
     def set_size(self, text):
-        self.lbl_size.configure(text=text)
+        if text != getattr(self, "_size_text", None):
+            self._size_text = text
+            self.lbl_size.configure(text=text)
+
+    def set_desc(self, text, color=None):
+        color = color or MUTED
+        key = (text, color)
+        if key != getattr(self, "_desc", None):
+            self._desc = key
+            self.lbl_desc.configure(text=text, text_color=color)
 
     def set_error(self, text):
-        self.lbl_desc.configure(text=short(text, 110), text_color=RED)
+        self.set_desc(short(text, 110), RED)
 
 
 # ---------------------------------------------------------------- aplicação
@@ -1040,12 +1087,21 @@ class App(ctk.CTk):
         self.cur_speed = 0
         self.last_summary = None
         self.pages = {}
+        self.page_ready = set()      # páginas já montadas (as outras só quando você abre)
+        self.page_builders = {}
+        self.stack = None
         self.nav = {}
         self.update_info = None
         self.upd_win = None
         self.toast_win = None
         self.history = load_history()
         self.hist_dirty = True       # a lista só é redesenhada quando a aba Histórico está aberta
+        self.hist_rows = []          # itens do filtro atual
+        self.hist_shown = 0          # quantos já foram desenhados
+        self.log_backlog = []        # mensagens guardadas até a aba Registro ser aberta
+        self.dirty_rows = set()      # fila: cartões que precisam de atualização
+        self.dirty_total = False     # painel de progresso precisa de atualização
+        self.stat_text = {}          # último texto de cada número do painel (evita redesenhar à toa)
         self.current_page = "download"
 
         self._make_vars()
@@ -1125,19 +1181,44 @@ class App(ctk.CTk):
         content.grid(row=0, column=1, sticky="nsew")
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
-        stack = ctk.CTkFrame(content, fg_color="transparent")
+        stack = self.stack = ctk.CTkFrame(content, fg_color="transparent")
         stack.grid(row=0, column=0, sticky="nsew")
         stack.columnconfigure(0, weight=1)
         stack.rowconfigure(0, weight=1)
-        self.pages["download"] = self._page_download(stack)
-        self.pages["queue"] = self._page_queue(stack)
-        self.pages["history"] = self._page_history(stack)
-        self.pages["settings"] = self._page_settings(stack)
-        self.pages["tools"] = self._page_tools(stack)
-        self.pages["log"] = self._page_log(stack)
+        self.page_builders = {
+            "download": self._page_download,
+            "queue": self._page_queue,
+            "history": self._page_history,
+            "settings": self._page_settings,
+            "tools": self._page_tools,
+            "log": self._page_log,
+        }
+        # Cada página só é montada na primeira visita. Montar as seis de uma vez deixava a
+        # abertura lenta e qualquer redesenho (minimizar, trocar de aba) carregava widgets à toa.
+        for name in self.page_builders:
+            if name not in ("download", "queue"):
+                self.pages[name] = ctk.CTkFrame(stack, fg_color="transparent")
+        # estas duas existem desde o começo: a fila recebe itens e a tela inicial é o download
+        self._build_page("download")
+        self._build_page("queue")
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
         self._build_total(content)
+
+    def _build_page(self, name):
+        """Monta a página na primeira vez que ela é aberta (as demais ficam só como lugar vazio)."""
+        if name in self.page_ready:
+            return self.pages[name]
+        placeholder = self.pages.get(name)
+        page = self.page_builders[name](self.stack)
+        page.grid(row=0, column=0, sticky="nsew")
+        if placeholder is not None:
+            placeholder.destroy()
+        self.pages[name] = page
+        self.page_ready.add(name)
+        if name == "log":
+            self._flush_log()
+        return page
 
     def _build_sidebar(self):
         side = ctk.CTkFrame(self, fg_color=SIDEBAR, corner_radius=0, width=230, border_width=0)
@@ -1176,7 +1257,7 @@ class App(ctk.CTk):
             b = ctk.CTkButton(
                 side, text=text, anchor="w", height=40, corner_radius=10,
                 fg_color="transparent", hover_color=SOFT_H, text_color=TXT,
-                font=ctk.CTkFont(size=14), command=lambda k=key: self._show(k),
+                font=font(14), command=lambda k=key: self._show(k),
             )
             b.grid(row=i, column=0, sticky="ew", padx=14, pady=2)
             self.nav[key] = b
@@ -1191,7 +1272,13 @@ class App(ctk.CTk):
         )
 
     def _show(self, name):
-        self.pages[name].tkraise()
+        self._build_page(name)
+        page = self.pages[name]
+        for key, other in self.pages.items():
+            if other is not page:  # só a página aberta fica mapeada: redesenhar as outras é caro
+                other.grid_remove()
+        page.grid(row=0, column=0, sticky="nsew")
+        page.tkraise()
         self.current_page = name
         if name == "history" and self.hist_dirty:
             self._render_history()
@@ -1216,7 +1303,7 @@ class App(ctk.CTk):
         head.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 6))
         head.columnconfigure(1, weight=1)
         lbl(head, "Progresso total", bold=True, size=14).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(head, textvariable=self.v_status, text_color=MUTED, anchor="w", font=ctk.CTkFont(size=12)).grid(
+        ctk.CTkLabel(head, textvariable=self.v_status, text_color=MUTED, anchor="w", font=font(12)).grid(
             row=0, column=1, sticky="ew", padx=14
         )
         self.lbl_pct = lbl(head, "0%", bold=True, size=14)
@@ -1289,7 +1376,7 @@ class App(ctk.CTk):
         inner.pack(fill="x", padx=16, pady=14)
         self.lbl_thumb = ctk.CTkLabel(
             inner, text="Sem\nminiatura", width=176, height=99, corner_radius=10,
-            fg_color=FIELD, text_color=MUTED, font=ctk.CTkFont(size=12),
+            fg_color=FIELD, text_color=MUTED, font=font(12),
         )
         self.lbl_thumb.pack(side="left")
         txt = ctk.CTkFrame(inner, fg_color="transparent")
@@ -1354,7 +1441,7 @@ class App(ctk.CTk):
         side = ctk.CTkFrame(row, fg_color="transparent")
         side.grid(row=0, column=1, sticky="n", padx=(14, 0))
         ctk.CTkLabel(side, textvariable=self.v_audio_hint, text_color=MUTED, wraplength=320, justify="left", anchor="w",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w")
+                     font=font(12)).pack(anchor="w")
         lbl(side, "Ou digite o idioma preferido (ex.: pt, en, ja)", size=12, muted=True).pack(anchor="w", pady=(8, 2))
         entry(side, self.v_lang, width=140).pack(anchor="w")
 
@@ -1445,40 +1532,70 @@ class App(ctk.CTk):
         self.lbl_hempty.pack(pady=(10, 0))
         self.hframe = ctk.CTkScrollableFrame(wrap, fg_color="transparent", corner_radius=0)
         self.hframe.pack(fill="both", expand=True)
+        self.btn_hmore = btn(wrap, "Mostrar mais", self._history_more, "soft", width=180)
+        self.lbl_hmore = lbl(wrap, "", muted=True, size=12)
         self._render_history()
         return page
 
     def _render_history(self):
+        """Recomeça a lista do histórico (busca, item novo, limpeza) e desenha o primeiro lote."""
+        if getattr(self, "hframe", None) is None:  # a aba Histórico ainda não foi montada
+            self.hist_dirty = True
+            return
         self.hist_dirty = False
         for w in self.hframe.winfo_children():
             w.destroy()
-        rows = filter_history(self.history, self.v_hsearch.get())
+        self.hist_rows = filter_history(self.history, self.v_hsearch.get())
+        self.hist_shown = 0
         self.nav["history"].configure(text="Histórico")
-        if not rows:
+        if not self.hist_rows:
             self.lbl_hempty.configure(
                 text="Nada encontrado." if self.history else "Ainda não há downloads no histórico."
             )
+            self.btn_hmore.pack_forget()
+            self.lbl_hmore.pack_forget()
             return
         self.lbl_hempty.configure(text="")
-        for e in rows[:100]:
-            r = ctk.CTkFrame(self.hframe, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
-            r.pack(fill="x", pady=5, padx=2)
-            r.columnconfigure(0, weight=1)
-            lbl(r, short(e.get("title") or e["url"]), bold=True, size=14, anchor="w", justify="left").grid(
-                row=0, column=0, sticky="ew", padx=14, pady=(10, 0))
-            ok = e.get("status") != "Erro"
-            info = " · ".join(x for x in (e.get("date", ""), fmt_size(e["size"]) if e.get("size") else "", e.get("status", "")) if x)
-            l2 = lbl(r, info, muted=True, size=12, anchor="w")
-            if not ok:
-                l2.configure(text_color=RED)
-            l2.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
-            acts = ctk.CTkFrame(r, fg_color="transparent")
-            acts.grid(row=0, column=1, rowspan=2, padx=10)
-            btn(acts, "Abrir pasta", lambda f=e.get("folder", ""): open_folder(f), "soft", width=100).pack(side="left", padx=3)
-            btn(acts, "Copiar link", lambda u=e["url"]: self._copy_text(u), "soft", width=100).pack(side="left", padx=3)
-            btn(acts, "Usar de novo", lambda u=e["url"]: self._reuse_url(u), "soft", width=110).pack(side="left", padx=3)
-        if len(rows) > 100:
-            lbl(self.hframe, f"Mostrando 100 de {len(rows)}. Use a busca para achar os outros.", muted=True, size=12).pack(pady=8)
+        self._history_more()
+
+    def _history_more(self):
+        """Desenha o próximo lote. Montar 100 cartões de uma vez travava a janela por segundos."""
+        rows = self.hist_rows
+        end = min(len(rows), self.hist_shown + HISTORY_BATCH, HISTORY_SHOWN_MAX)
+        for e in rows[self.hist_shown:end]:
+            self._history_row(e)
+        self.hist_shown = end
+        rest = min(len(rows), HISTORY_SHOWN_MAX) - end
+        if rest > 0:
+            self.btn_hmore.configure(text=f"Mostrar mais ({rest})")
+            if not self.btn_hmore.winfo_manager():
+                self.btn_hmore.pack(pady=(4, 0))
+        else:
+            self.btn_hmore.pack_forget()
+        if len(rows) > HISTORY_SHOWN_MAX:
+            self.lbl_hmore.configure(text=f"Mostrando os {HISTORY_SHOWN_MAX} mais recentes. Use a busca para achar os outros.")
+            if not self.lbl_hmore.winfo_manager():
+                self.lbl_hmore.pack(pady=(4, 8))
+        else:
+            self.lbl_hmore.pack_forget()
+
+    def _history_row(self, e):
+        r = ctk.CTkFrame(self.hframe, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
+        r.pack(fill="x", pady=5, padx=2)
+        r.columnconfigure(0, weight=1)
+        lbl(r, short(e.get("title") or e["url"]), bold=True, size=14, anchor="w", justify="left").grid(
+            row=0, column=0, sticky="ew", padx=14, pady=(10, 0))
+        ok = e.get("status") != "Erro"
+        info = " · ".join(x for x in (e.get("date", ""), fmt_size(e["size"]) if e.get("size") else "", e.get("status", "")) if x)
+        l2 = lbl(r, info, muted=True, size=12, anchor="w")
+        if not ok:
+            l2.configure(text_color=RED)
+        l2.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        acts = ctk.CTkFrame(r, fg_color="transparent")
+        acts.grid(row=0, column=1, rowspan=2, padx=10)
+        btn(acts, "Abrir pasta", lambda f=e.get("folder", ""): open_folder(f), "soft", width=100).pack(side="left", padx=3)
+        btn(acts, "Copiar link", lambda u=e["url"]: self._copy_text(u), "soft", width=100).pack(side="left", padx=3)
+        btn(acts, "Usar de novo", lambda u=e["url"]: self._reuse_url(u), "soft", width=110).pack(side="left", padx=3)
 
     def _copy_text(self, text):
         self.clipboard_clear()
@@ -1510,7 +1627,7 @@ class App(ctk.CTk):
         del self.history[HISTORY_MAX:]
         save_history(self.history)
         self.hist_dirty = True
-        if self.current_page == "history":
+        if self.current_page == "history" and self.state() != "iconic":
             self._render_history()
 
     # ------------------------------------------------------------ aviso ao terminar
@@ -1532,7 +1649,7 @@ class App(ctk.CTk):
             box.pack(fill="both", expand=True)
             lbl(box, title, bold=True, size=14).pack(anchor="w", padx=16, pady=(12, 0))
             ctk.CTkLabel(box, text=text, text_color=MUTED, justify="left", anchor="w", wraplength=300,
-                         font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16, pady=(2, 12))
+                         font=font(12)).pack(anchor="w", padx=16, pady=(2, 12))
             t.update_idletasks()
             w, h = max(t.winfo_reqwidth(), 340), t.winfo_reqheight()
             t.geometry(f"{w}x{h}+{self.winfo_screenwidth() - w - 24}+{self.winfo_screenheight() - h - 72}")
@@ -1636,7 +1753,7 @@ class App(ctk.CTk):
         c = card(wrap)
         c.pack(fill="x", pady=6)
         ctk.CTkLabel(c, textvariable=self.v_tools, justify="left", anchor="w", text_color=TXT,
-                     font=ctk.CTkFont(family="Consolas" if IS_WIN else "monospace", size=12)).pack(fill="x", padx=18, pady=16)
+                     font=font(12, family="Consolas" if IS_WIN else "monospace")).pack(fill="x", padx=18, pady=16)
         c2 = card(wrap)
         c2.pack(fill="x", pady=6)
         inner = ctk.CTkFrame(c2, fg_color="transparent")
@@ -1660,7 +1777,7 @@ class App(ctk.CTk):
         about.pack(fill="x", padx=18, pady=16)
         lbl(about, f"{APP_NAME} v{APP_VERSION}  ·  software livre (licença MIT)", bold=True).pack(anchor="w")
         ctk.CTkLabel(about, text=ABOUT_TEXT, justify="left", anchor="w", text_color=MUTED, wraplength=760,
-                     font=ctk.CTkFont(size=12)).pack(fill="x", pady=(6, 10))
+                     font=font(12)).pack(fill="x", pady=(6, 10))
         btn(about, "Licenças e créditos", self._about_dialog, "soft", width=190).pack(anchor="w")
         self._refresh_tools()
         return page
@@ -1692,7 +1809,7 @@ class App(ctk.CTk):
         win.transient(self)
         self.about_text = ctk.CTkTextbox(
             win, corner_radius=12, fg_color=CARD, border_width=1, border_color=BORDER, text_color=TXT, wrap="word",
-            font=ctk.CTkFont(size=12),
+            font=font(12),
         )
         self.about_text.pack(fill="both", expand=True, padx=18, pady=(18, 8))
         self.about_text.insert("1.0", text)
@@ -1711,7 +1828,7 @@ class App(ctk.CTk):
         btn(bar, "Limpar registro", self._clear_log, "soft", width=140).pack(side="left")
         self.txt_log = ctk.CTkTextbox(
             wrap, corner_radius=12, fg_color=CARD, border_width=1, border_color=BORDER, text_color=TXT,
-            font=ctk.CTkFont(family="Consolas" if IS_WIN else "monospace", size=12), wrap="word",
+            font=font(12, family="Consolas" if IS_WIN else "monospace"), wrap="word",
         )
         self.txt_log.pack(fill="both", expand=True)
         self.txt_log.configure(state="disabled")
@@ -1791,8 +1908,26 @@ class App(ctk.CTk):
             self.v_cookiefile.set(path)
 
     def _log(self, msg):
+        text = str(msg).rstrip() + "\n"
+        if "log" not in self.page_ready:  # a aba Registro é montada só quando aberta
+            self.log_backlog.append(text)
+            del self.log_backlog[:-800]
+            return
         self.txt_log.configure(state="normal")
-        self.txt_log.insert("end", str(msg).rstrip() + "\n")
+        self.txt_log.insert("end", text)
+        lines = int(self.txt_log.index("end-1c").split(".")[0])
+        if lines > 1000:
+            self.txt_log.delete("1.0", f"{lines - 800}.0")
+        self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
+
+    def _flush_log(self):
+        """Passa para a aba Registro o que foi recebido antes dela existir."""
+        if not self.log_backlog or not getattr(self, "txt_log", None):
+            return
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", "".join(self.log_backlog))
+        self.log_backlog.clear()
         lines = int(self.txt_log.index("end-1c").split(".")[0])
         if lines > 1000:
             self.txt_log.delete("1.0", f"{lines - 800}.0")
@@ -2048,10 +2183,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Atenção", "Escolha a pasta de destino.")
             return None
         opts["paths"] = {"home": folder}
-        tpl = TEMPLATES[self.v_template.get()]
-        if self.v_plfolder.get():
-            tpl = "%(playlist_title&{}/|)s" + tpl
-        opts["outtmpl"] = tpl
+        opts["outtmpl"] = build_outtmpl(self.v_template.get(), self.v_plfolder.get(), is_playlist)
         opts["noplaylist"] = not self.v_playlist.get() and not is_playlist
         opts["windowsfilenames"] = IS_WIN
         opts["trim_file_name"] = 150
@@ -2251,7 +2383,9 @@ class App(ctk.CTk):
         self.last_summary = None
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
+        self.stat_text["pct_val"] = 0.0
         self.bar_total.set(0)
+        self.lbl_pct.configure(text="0%")
         self.v_status.set("Baixando…")
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
@@ -2260,7 +2394,7 @@ class App(ctk.CTk):
         row = self.items[iid]["row"]
         row.set_state("Aguardando")
         row.set_progress(0)
-        row.lbl_desc.configure(text=short(self.items[iid]["desc"], 80), text_color=MUTED)
+        row.set_desc(short(self.items[iid]["desc"], 80), MUTED)
         est = self.items[iid].get("est")
         row.set_size(f"~{fmt_size(est)}" if est else "")
 
@@ -2392,6 +2526,7 @@ class App(ctk.CTk):
             it["row"].set_title(d["title"])
 
     def _refresh_row(self, iid):
+        """Leva para o cartão da fila o que está no modelo do item."""
         it = self.items.get(iid)
         if not it:
             return
@@ -2401,33 +2536,40 @@ class App(ctk.CTk):
             row.set_size(f"{fmt_size(it['done'])} / {'~' if it['approx'] else ''}{fmt_size(it['total'])}")
         elif it["done"]:
             row.set_size(fmt_size(it["done"]))
-        if it["status"] == "Baixando" and it.get("live"):
-            row.set_state(it["live"], ACCENT)
+        status = it["status"]
+        if status == "Baixando":
+            row.set_state(it.get("live") or "Baixando…", ACCENT)
+        elif status in ("Concluído", "Concluído com avisos"):
+            row.set_state(status, DONE)
+        elif status == "Erro":
+            row.set_state("Erro", RED)
+            row.set_error(it.get("error") or "Falhou. Veja o Registro.")
+        elif status == "Cancelado":
+            row.set_state("Cancelado")
+        else:
+            row.set_state("Aguardando")
+        row.btn_x.configure(state="disabled" if status == "Baixando" else "normal")
 
     def _on_state(self, iid, status, extra):
         it = self.items.get(iid)
         if not it:
             return
         it["status"] = status
-        row = it["row"]
-        if status == "Baixando":
-            row.set_state("Baixando…", ACCENT)
-        elif status in ("Concluído", "Concluído com avisos"):
+        if status in ("Concluído", "Concluído com avisos"):
             it["frac"] = 1.0
             it["total"] = max(it["total"], it["done"])
             it["approx"] = False
-            row.set_state(status, DONE)
-            row.set_progress(1.0)
-            if it["done"]:
-                row.set_size(fmt_size(it["done"]))
-            self._record_history(it, status)
         elif status == "Erro":
-            row.set_state("Erro", RED)
-            row.set_error(extra or "Falhou. Veja o Registro.")
+            it["error"] = extra or "Falhou. Veja o Registro."
+        if status in ("Concluído", "Concluído com avisos", "Erro"):
             self._record_history(it, status)
-        elif status == "Cancelado":
-            row.set_state("Cancelado")
-        row.btn_x.configure(state="disabled" if status == "Baixando" else "normal")
+        self.dirty_rows.add(iid)
+
+    def _stat(self, key, text):
+        """Só mexe no rótulo quando o texto muda de verdade."""
+        if self.stat_text.get(key) != text:
+            self.stat_text[key] = text
+            self.stat[key].configure(text=text)
 
     def _refresh_total(self):
         ids = [i for i in self.run_ids if i in self.items]
@@ -2450,22 +2592,24 @@ class App(ctk.CTk):
             if not t or it["approx"]:
                 unknown = unknown or not t
         pct = frac_sum / n
-        self.bar_total.set(min(pct, 1.0))
-        self.lbl_pct.configure(text=f"{pct * 100:.0f}%")
-        self.stat["items"].configure(text=f"{finished} de {n}")
+        if abs(pct - self.stat_text.get("pct_val", -1.0)) >= 0.001:
+            self.stat_text["pct_val"] = pct
+            self.bar_total.set(min(pct, 1.0))
+            self.lbl_pct.configure(text=f"{pct * 100:.0f}%")
+        self._stat("items", f"{finished} de {n}")
         if total_b and not unknown:
-            self.stat["bytes"].configure(text=f"{fmt_size(done_b)} / ~{fmt_size(max(total_b, done_b))}")
+            self._stat("bytes", f"{fmt_size(done_b)} / ~{fmt_size(max(total_b, done_b))}")
         else:
-            self.stat["bytes"].configure(text=f"{fmt_size(done_b)} baixados")
+            self._stat("bytes", f"{fmt_size(done_b)} baixados")
         if self.running and self.cur_speed:
-            self.stat["speed"].configure(text=f"{fmt_size(self.cur_speed)}/s")
+            self._stat("speed", f"{fmt_size(self.cur_speed)}/s")
             if total_b and not unknown and total_b > done_b:
-                self.stat["eta"].configure(text=fmt_dur((total_b - done_b) / self.cur_speed))
+                self._stat("eta", fmt_dur((total_b - done_b) / self.cur_speed))
             else:
-                self.stat["eta"].configure(text="calculando…")
+                self._stat("eta", "calculando…")
         elif not self.running:
-            self.stat["speed"].configure(text="—")
-            self.stat["eta"].configure(text="—")
+            self._stat("speed", "—")
+            self._stat("eta", "—")
 
     # ------------------------------------------------------------ fila de mensagens (threads -> interface)
     def _pump(self):
@@ -2522,17 +2666,32 @@ class App(ctk.CTk):
                     self._log(f"(erro interno na interface: {exc})")
         except queue.Empty:
             pass
+        self.dirty_rows |= rows
+        if dirty:
+            self.dirty_total = True
+        self._flush_ui()
+        self.after(80, self._pump)
+
+    def _flush_ui(self):
+        """Aplica na tela o que mudou. Com a janela minimizada nada é desenhado: os pedidos
+        ficam guardados e saem de uma vez quando ela volta (redesenhar escondido atrasava a volta)."""
+        if self.state() == "iconic":
+            return
+        rows, self.dirty_rows = self.dirty_rows, set()
         for iid in rows:
             self._refresh_row(iid)
-        if dirty or self.running:
+        if self.dirty_total or self.running:
             self._refresh_total()
-        self.after(80, self._pump)
+        self.dirty_total = False
+        if self.current_page == "history" and self.hist_dirty:
+            self._render_history()  # ficou pendente enquanto a janela estava minimizada
 
     def _on_fim(self, ok, failed):
         self.running = False
         self.btn_start.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
-        self._refresh_total()
+        self.dirty_total = True
+        self._flush_ui()
         done_b = sum(self.items[i]["done"] for i in self.run_ids if i in self.items)
         if self.cancel.is_set():
             self.v_status.set("Cancelado.")
@@ -2545,8 +2704,8 @@ class App(ctk.CTk):
                         "Downloads terminados" if not failed else "Downloads terminaram com erros",
                         f"{ok} com sucesso, {failed} com erro  ·  {fmt_size(done_b)} baixados",
                     )
-        self.stat["speed"].configure(text="—")
-        self.stat["eta"].configure(text="—")
+        self._stat("speed", "—")
+        self._stat("eta", "—")
 
     # ------------------------------------------------------------ atualização do próprio programa
     def _startup_update_check(self):

@@ -21,7 +21,17 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="ytdlpgui_test_")
-os.environ["XDG_CONFIG_HOME"] = os.path.join(TMP, "cfg")
+
+
+def cfg_env(base):
+    """Variáveis que fazem o programa usar uma pasta de dados descartável.
+
+    No Linux vale XDG_CONFIG_HOME; no Windows, APPDATA. Os testes precisam dos dois
+    para não ler nem sobrescrever as configurações reais de quem está rodando."""
+    return {"XDG_CONFIG_HOME": base, "APPDATA": base}
+
+
+os.environ.update(cfg_env(os.path.join(TMP, "cfg")))
 
 spec = importlib.util.spec_from_file_location("g", os.path.join(ROOT, "ytdlp_gui.py"))
 g = importlib.util.module_from_spec(spec)
@@ -112,12 +122,30 @@ check("tamanho: sem formatos -> None", g.estimate_size({"formats": []}, "b", Fal
 # ------------------------------------------------------------ nomes de arquivo
 single = {"id": "abc", "title": "Meu Vídeo", "ext": "mp4", "uploader": "Canal", "playlist_title": None, "playlist_index": None}
 plist = dict(single, playlist_title="Lista", playlist_index=3)
-for tname, tpl in g.TEMPLATES.items():
+HOME_DL = os.path.join(TMP, "dl")
+for tname in g.TEMPLATES:
     for pf in (False, True):
-        full = ("%(playlist_title&{}/|)s" if pf else "") + tpl
-        ydl = yt_dlp.YoutubeDL({"quiet": True, "paths": {"home": "/dl"}, "outtmpl": full, "windowsfilenames": False})
-        a, b = ydl.prepare_filename(single), ydl.prepare_filename(plist)
-        check(f"nome: {tname} pasta={pf}", a.startswith("/dl/") and "//" not in a and b.startswith("/dl/"), f"{a} | {b}")
+        full = g.build_outtmpl(tname, playlist_folder=pf, is_playlist=False)
+        ydl = yt_dlp.YoutubeDL({"quiet": True, "paths": {"home": HOME_DL}, "outtmpl": full, "windowsfilenames": False})
+        a = ydl.prepare_filename(single)
+        full_pl = g.build_outtmpl(tname, playlist_folder=pf, is_playlist=True)
+        ydl = yt_dlp.YoutubeDL({"quiet": True, "paths": {"home": HOME_DL}, "outtmpl": full_pl, "windowsfilenames": False})
+        b = ydl.prepare_filename(plist)
+        prefix = HOME_DL + os.sep
+        check(f"nome: {tname} pasta={pf}", a.startswith(prefix) and os.sep * 2 not in a and "⧸" not in a + b,
+              f"{a} | {b}")
+        if pf:  # a playlist precisa cair numa subpasta, não num arquivo solto com "⧸" no nome
+            check(f"nome: {tname} playlist em subpasta", b.startswith(prefix + "Lista" + os.sep), b)
+        else:
+            check(f"nome: {tname} playlist sem pasta extra", os.path.dirname(b) == HOME_DL, b)
+check("nome: vídeo solto nunca ganha pasta de playlist",
+      not g.build_outtmpl("Título", True, False).startswith("%(playlist_title"),
+      g.build_outtmpl("Título", True, False))
+check("nome: playlist ganha a pasta na frente",
+      g.build_outtmpl("Título", True, True) == "%(playlist_title|Playlist)s/%(title)s.%(ext)s",
+      g.build_outtmpl("Título", True, True))
+check("nome: modelo desconhecido cai no padrão",
+      g.build_outtmpl("não existe", False, False) == g.TEMPLATES["Título"])
 
 # ------------------------------------------------------------ interface
 app = g.App()
@@ -142,11 +170,21 @@ def txt(widget):
 
 check("UI: 6 páginas", set(app.pages) == {"download", "queue", "history", "settings", "tools", "log"}, list(app.pages))
 check("UI: janela cabe na tela", app.winfo_width() <= app.winfo_screenwidth() + 5)
+check("UI: na abertura só o essencial é montado", app.page_ready == {"download", "queue"}, sorted(app.page_ready))
+check("UI: só a aba aberta fica na tela",
+      [k for k, p in app.pages.items() if p.winfo_ismapped()] == ["download"],
+      [k for k, p in app.pages.items() if p.winfo_ismapped()])
 for name in app.pages:
     app._show(name)
     pump(0.05)
 check("UI: navegar entre páginas", True)
+check("UI: cada aba é montada na primeira visita", app.page_ready == set(app.pages), sorted(app.page_ready))
+check("UI: trocar de aba não monta tudo de novo", app._build_page("tools") is app.pages["tools"])
 app._show("download")
+pump(0.05)
+check("UI: as abas fechadas saem da tela (não são redesenhadas)",
+      [k for k, p in app.pages.items() if p.winfo_ismapped()] == ["download"],
+      [k for k, p in app.pages.items() if p.winfo_ismapped()])
 
 INFO = {
     "_type": "video", "id": "x", "title": "Vídeo de teste", "uploader": "Canal", "duration": 125,
@@ -335,6 +373,41 @@ for iid in list(app.order):
     app.items[iid]["status"] = "Aguardando"
     app._remove_item(iid)
 check("fila: remover tudo", not app.items and app.nav["queue"].cget("text") == "Fila")
+
+# o cartão só é redesenhado quando o valor muda de verdade
+row = g.QueueRow(app.qframe, "T", "d", on_remove=lambda: None)
+calls = []
+real_cfg = row.lbl_state.configure
+row.lbl_state.configure = lambda **kw: (calls.append(kw), real_cfg(**kw))
+row.set_state("Baixando…", g.ACCENT)
+row.set_state("Baixando…", g.ACCENT)
+row.set_progress(0.5)
+row.set_progress(0.5)
+row.set_size("10 MB")
+row.set_size("10 MB")
+check("fila: cartão só muda quando o valor muda", len(calls) == 1, calls)
+row.destroy()
+
+# com a janela minimizada nada vai para a tela; sai tudo de uma vez na volta
+calls = []
+real_refresh, real_state = app._refresh_row, app.state
+app._refresh_row = lambda iid: calls.append(iid)
+fake = {"row": None, "frac": 0.5, "done": 50, "total": 100, "approx": False, "status": "Baixando",
+        "est": None, "live": "", "playlist": False, "entries": {}, "files": {}, "n_entries": 0}
+app.items["zz"] = fake
+app.run_ids = {"zz"}
+app.dirty_rows.clear()
+app.dirty_rows.add("zz")
+app.state = lambda: "iconic"
+app._flush_ui()
+check("minimizado: nada é desenhado e o pedido fica guardado", calls == [] and app.dirty_rows == {"zz"}, calls)
+app.state = real_state
+app._flush_ui()
+check("restaurado: o que ficou pendente é desenhado", calls == ["zz"] and not app.dirty_rows, calls)
+app._refresh_row = real_refresh
+app.items.pop("zz")
+app.run_ids.clear()
+del app.state
 
 # ------------------------------------------------------------ download de ponta a ponta (servidor local)
 media = os.path.join(TMP, "media")
@@ -1072,6 +1145,37 @@ app._show("history")
 check("histórico: ao abrir a aba a lista é desenhada", not app.hist_dirty and len(app.hframe.winfo_children()) == 1)
 app._show("download")
 
+# histórico grande: desenha em lotes, sem travar a janela
+app.history = [{"title": f"Item {i}", "url": f"https://z/{i}", "size": 1000, "status": "Concluído",
+                "date": "13/11/2026 13:08"} for i in range(30)]
+app._show("history")
+app._render_history()
+check("histórico: só o primeiro lote é desenhado",
+      len(app.hframe.winfo_children()) == g.HISTORY_BATCH and app.hist_shown == g.HISTORY_BATCH,
+      f"{len(app.hframe.winfo_children())} / {app.hist_shown}")
+check("histórico: botão 'Mostrar mais' aparece com o resto", app.btn_hmore.winfo_manager() == "pack"
+      and "18" in app.btn_hmore.cget("text"), app.btn_hmore.cget("text"))
+app._history_more()
+check("histórico: 'Mostrar mais' desenha o lote seguinte",
+      len(app.hframe.winfo_children()) == 2 * g.HISTORY_BATCH, len(app.hframe.winfo_children()))
+app._history_more()
+check("histórico: no fim o botão some", app.btn_hmore.winfo_manager() == "" and len(app.hframe.winfo_children()) == 30,
+      len(app.hframe.winfo_children()))
+app.history = [{"title": f"Item {i}", "url": f"https://z/{i}"} for i in range(g.HISTORY_SHOWN_MAX + 20)]
+app._render_history()
+for _ in range(20):
+    app._history_more()
+check("histórico: nunca passa do limite na tela",
+      len(app.hframe.winfo_children()) == g.HISTORY_SHOWN_MAX and app.lbl_hmore.winfo_manager() == "pack",
+      f"{len(app.hframe.winfo_children())} | {app.lbl_hmore.cget('text')}")
+app.v_hsearch.set("Item 1")
+check("histórico: busca acha o que não está na tela",
+      len(app.hframe.winfo_children()) == min(g.HISTORY_BATCH, len(g.filter_history(app.history, "Item 1"))))
+app.v_hsearch.set("")
+app.history = []
+app._render_history()
+app._show("download")
+
 # ------------------------------------------------------------ aviso ao terminar
 app._toast("Teste", "Mensagem de teste", ms=60000)
 app.update()
@@ -1220,7 +1324,8 @@ app.destroy()
 httpd.shutdown()
 
 # ------------------------------------------------------------ atualização por zipapp
-cfgdir = os.path.join(TMP, "cfg2", "VibeGrap")
+CFG2 = os.path.join(TMP, "cfg2")
+cfgdir = os.path.join(CFG2, "VibeGrap")
 os.makedirs(cfgdir, exist_ok=True)
 site = os.path.dirname(yt_dlp.__file__)
 zpath = os.path.join(cfgdir, "yt-dlp")
@@ -1230,8 +1335,9 @@ with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
             continue
         for fn in fs:
             full = os.path.join(root, fn)
-            z.write(full, os.path.join("yt_dlp", os.path.relpath(full, site)))
-env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(TMP, "cfg2"))
+            arcname = "yt_dlp/" + os.path.relpath(full, site).replace(os.sep, "/")
+            z.write(full, arcname)
+env = dict(os.environ, **cfg_env(CFG2))
 code = (
     "import importlib.util,sys;"
     f"s=importlib.util.spec_from_file_location('g',{os.path.join(ROOT, 'ytdlp_gui.py')!r});m=importlib.util.module_from_spec(s);"
