@@ -537,11 +537,14 @@ app.v_limit.set("100K")
 set_url(BASE + "/big.mp4")
 iid = app._add_clicked()
 app._start_queue()
-pump(3)
+end = time.time() + 20  # o yt-dlp pode demorar alguns segundos até o 1º progresso
+while time.time() < end and not (app.items[iid]["frac"] > 0):
+    pump(0.1)
+pump(0.2)
 check("E2E cancelar: progresso ao vivo no cartão", "%" in txt(app.items[iid]["row"].lbl_state) or app.items[iid]["frac"] > 0, txt(app.items[iid]["row"].lbl_state))
 check("E2E cancelar: painel mostra velocidade ao vivo", "/s" in txt(app.stat["speed"]), txt(app.stat["speed"]))
 app._cancel()
-end = time.time() + 20
+end = time.time() + 30
 while time.time() < end and app.worker.is_alive():
     pump(0.1)
 pump(0.4)
@@ -749,6 +752,24 @@ app.upd_win = None
 opened.clear()
 app._on_upd_msg(("upd", "done", None, "queda de conexão"))
 check("update: falha no download oferece a página de Releases", calls and calls[-1][0] == "askyesno" and opened, (calls[-1][0] if calls else None, opened))
+
+# cookies do navegador: o erro de criptografia (DPAPI) mostra o passo a passo, sem "detalhe técnico"
+calls.clear()
+app._show("download")
+app.q.put(("info_error", "https://youtu.be/x",
+           "ERROR: Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927 for more info"))
+end = time.time() + 5
+while time.time() < end and not calls:
+    pump(0.1)
+msg = calls[-1][1][1] if calls else ""
+check("cookies: DPAPI mostra o passo a passo do cookies.txt",
+      bool(calls) and calls[-1][0] == "askyesno" and "cookies.txt" in msg and "LOCALLY" in msg, msg[:200])
+check("cookies: nesse caso não mostra o 'detalhe técnico'", "Detalhe técnico" not in msg, msg[:80])
+check("cookies: aceitar leva às Configurações", app.current_page == "settings", app.current_page)
+check("cookies: o passo a passo também fica no Registro",
+      "Get cookies.txt LOCALLY" in app.txt_log.get("1.0", "end"))
+app._show("download")
+calls.clear()
 
 # instalador silencioso: comando exato (sem fechar o teste!)
 cmd = app._launch_installer(r"C:\Temp\VibeGrap-Setup.exe")
@@ -1092,6 +1113,15 @@ check("erro: vídeo removido", "indisponível" in FE("ERROR: Video unavailable. 
 check("erro: sem internet", "conexão" in FE("<urlopen error [Errno -2] Name or service not known>") and "conexão" in FE("Unable to download webpage: timed out"))
 check("erro: 429 e 403", "limitou" in FE("HTTP Error 429: Too Many Requests") and "403" in FE("HTTP Error 403: Forbidden"))
 check("erro: ffmpeg ausente", "ffmpeg" in FE("ERROR: Postprocessing: ffprobe and ffmpeg not found"))
+check("erro: cookies com DPAPI explicam o cookies.txt",
+      "cookies.txt" in FE("Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927 for more info"),
+      FE("Failed to decrypt with DPAPI."))
+check("erro: banco de cookies travado pelo navegador aberto",
+      "Feche o navegador" in FE("ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"),
+      FE("Could not copy Chrome cookie database."))
+check("erro: DPAPI não é confundido com restrição de idade",
+      "criptografia" in FE("ERROR: Failed to decrypt with DPAPI") and g.cookie_error("Failed to decrypt with DPAPI")
+      and not g.cookie_error("Sign in to confirm your age"))
 check("erro: disco cheio e permissão", "disco" in FE("[Errno 28] No space left on device") and "permissão" in FE("[Errno 13] Permission denied: 'x'"))
 check("erro: formato indisponível", "Melhor disponível" in FE("ERROR: Requested format is not available"))
 check("erro: link não suportado", "suportado" in FE("ERROR: Unsupported URL: https://example.com/x"))

@@ -6,6 +6,7 @@
 - Histórico bem mais rápido: a lista aparece em lotes de 12 itens, com o botão "Mostrar mais", em vez de montar tudo de uma vez.
 - As abas são montadas só quando abertas: o programa abre mais rápido e trocar de aba ficou mais leve.
 - Com a janela minimizada nada é redesenhado; a fila e o histórico se atualizam de uma vez quando você volta.
+- Aviso claro quando o navegador (Chrome, Brave ou Edge novos) não deixa ler os cookies por causa da criptografia DPAPI, com o passo a passo para usar um arquivo cookies.txt.
 
 ## [2.2.0]
 

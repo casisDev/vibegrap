@@ -660,6 +660,12 @@ def extract_from_zip(zip_path, wanted, require_bin_dir=False):
 # ---------------------------------------------------------------- erros em português
 # (padrão no texto do erro, mensagem para o usuário). A primeira regra que combinar vence.
 ERROR_RULES = [
+    (r"decrypt with dpapi|app[- ]bound encryption",
+     "Não consegui ler os cookies desse navegador: o Chrome, o Brave e o Edge protegem os cookies com uma "
+     "criptografia (DPAPI) que o yt-dlp não abre. Exporte os cookies num arquivo cookies.txt e escolha em "
+     "Configurações → “ou arquivo cookies.txt”."),
+    (r"could not copy chrome cookie database",
+     "O navegador estava aberto e travou o arquivo de cookies. Feche o navegador e tente de novo, ou use um arquivo cookies.txt."),
     (r"not a bot|confirm you.re not a bot",
      "O YouTube pediu uma verificação anti-robô. Em Configurações, escolha o navegador em “Cookies do navegador” "
      "(onde você está logado) e atualize o yt-dlp em Ferramentas."),
@@ -710,6 +716,23 @@ def clean_error(text):
     text = re.sub(r"^(ERROR:\s*)+", "", text)
     text = re.sub(r"^(?:\[[A-Za-z][\w:.-]*\]\s*(?:[\w-]+:\s+)?)+", "", text).strip()
     return text
+
+
+COOKIE_ERROR = re.compile(
+    r"decrypt with dpapi|app[- ]bound encryption|could not copy chrome cookie database", re.I)
+
+COOKIE_HELP = (
+    "Como resolver: o Chrome, o Brave e o Edge (versões novas) guardam os cookies com uma proteção "
+    "(DPAPI) que o yt-dlp não consegue abrir.\n\n"
+    "1) Instale a extensão “Get cookies.txt LOCALLY” no navegador e exporte os cookies do YouTube.\n"
+    "2) Em Configurações → “ou arquivo cookies.txt”, escolha o arquivo exportado.\n\n"
+    "Alternativa: em “Cookies do navegador”, use o Firefox logado no YouTube."
+)
+
+
+def cookie_error(text):
+    """Erro de leitura dos cookies do navegador (não é falta de login)."""
+    return bool(COOKIE_ERROR.search(str(text or "")))
 
 
 def friendly_error(text):
@@ -1720,7 +1743,7 @@ class App(ctk.CTk):
         row(1, "Nome do arquivo", lambda p: menu(p, self.v_template, list(TEMPLATES), width=240))
         row(2, "Limite de velocidade", lambda p: entry(p, self.v_limit, width=160), "ex.: 500K, 2M")
         row(3, "Proxy", lambda p: entry(p, self.v_proxy), "ex.: http://127.0.0.1:8080")
-        row(4, "Cookies do navegador", lambda p: menu(p, self.v_browser, BROWSERS, width=160), "para vídeos com login ou restrição de idade")
+        row(4, "Cookies do navegador", lambda p: menu(p, self.v_browser, BROWSERS, width=160), "para login ou restrição de idade")
 
         def cookie_row(p):
             f = ctk.CTkFrame(p, fg_color="transparent")
@@ -1729,7 +1752,13 @@ class App(ctk.CTk):
             btn(f, "Escolher…", self._choose_cookies, "soft", width=96).grid(row=0, column=1, padx=(8, 0))
             return f
 
-        row(5, "ou arquivo cookies.txt", cookie_row)
+        row(5, "ou arquivo cookies.txt", cookie_row, "funciona com qualquer navegador")
+        lbl(
+            wrap,
+            "Chrome, Brave e Edge novos guardam os cookies protegidos (DPAPI) e o yt-dlp não consegue lê-los: "
+            "nesses casos use o arquivo cookies.txt, exportado pela extensão “Get cookies.txt LOCALLY”, ou o Firefox.",
+            muted=True, size=12, anchor="w", justify="left", wraplength=760,
+        ).pack(anchor="w", padx=18, pady=(0, 6))
 
         c = card(wrap)
         c.pack(fill="x", pady=6)
@@ -2442,6 +2471,8 @@ class App(ctk.CTk):
                     raw = clean_error(exc)
                     error = friendly_error(raw)
                     self.q.put(("log", f"Falhou: {raw}"))
+                    if cookie_error(raw):
+                        self.q.put(("log", COOKIE_HELP))
             self.q.put(("state", iid, item["status"], error))
         self.q.put(("fim", ok, failed))
 
@@ -2641,6 +2672,15 @@ class App(ctk.CTk):
                         self.lbl_title.configure(text="Falha ao analisar o link.")
                         self.lbl_meta.configure(text=short(msg[2], 160))
                         self._log("Erro ao analisar: " + msg[2])
+                        if cookie_error(msg[2]):
+                            self._log(COOKIE_HELP)
+                            if messagebox.askyesno(
+                                "Cookies do navegador",
+                                friendly_error(msg[2]) + "\n\n" + COOKIE_HELP
+                                + "\n\nAbrir as Configurações para escolher o arquivo cookies.txt agora?",
+                            ):
+                                self._show("settings")
+                            continue
                         hint = ""
                         if "youtu" in msg[1] and not detect_js_runtime():
                             hint = "\n\nDica: o YouTube exige um runtime JavaScript (Deno). Abra Ferramentas e instale."
