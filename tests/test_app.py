@@ -1084,7 +1084,7 @@ for fname in ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "CONTRIBUTING.md
     check(f"repositório: {fname} existe", os.path.isfile(os.path.join(ROOT, fname)))
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README: autoria casisDev e vibe coding logo no começo",
-      "casisDev" in "\n".join(readme.splitlines()[:6]) and "vibe coding" in "\n".join(readme.splitlines()[:6]).lower(), readme.splitlines()[2:4])
+      "casisDev" in "\n".join(readme.splitlines()[:12]) and "vibe coding" in "\n".join(readme.splitlines()[:12]).lower(), readme.splitlines()[2:4])
 _cl = open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8").read()
 _bw = open(os.path.join(ROOT, ".github", "workflows", "build.yml"), encoding="utf-8").read()
 check("CHANGELOG: tem uma seção por versão e a versão atual do workflow tem notas", "## [2.1.0]" in _cl and "## [2.0.0]" in _cl)
@@ -1236,6 +1236,66 @@ check("aviso: cancelado, não avisa", not shown)
 app.cancel.clear()
 app._toast, app._should_notify = real_toast, real_should
 check("aviso: padrão ligado e salvo nas configurações", g.DEFAULT_CFG["notify"] is True and "notify" in g.DEFAULT_CFG)
+
+# ------------------------------------------------------------ miniatura e análise (regressão: imagem morta)
+from PIL import Image as _PILImage  # noqa: E402
+
+_png = io.BytesIO()
+_PILImage.new("RGB", (320, 180), (180, 20, 20)).save(_png, "PNG")
+THUMB = _png.getvalue()
+app._show("download")
+real_fetch = app._fetch_thumb
+app._fetch_thumb = lambda url: app.q.put(("thumb", url, THUMB))
+app._on_info("http://local/a", {"_type": "video", "id": "a", "title": "Primeiro vídeo",
+                                "formats": [], "thumbnail": "http://local/a.png"})
+pump(0.25)
+app._on_info("http://local/b", {"_type": "video", "id": "b", "title": "Segundo vídeo",
+                                "formats": [], "thumbnail": "http://local/b.png"})
+pump(0.25)
+check("miniatura: analisar outro link não prende a tela em 'Analisando…'",
+      txt(app.lbl_title) == "Segundo vídeo", txt(app.lbl_title))
+_names = {str(n) for n in app.tk.call("image", "names")}
+_img_name = str(app.lbl_thumb._label.cget("image"))
+check("miniatura: o rótulo nunca fica apontando para uma imagem apagada",
+      _img_name in _names, f"{_img_name} em {len(_names)} imagens")
+_app_log = "".join(app.log_backlog) + (app.txt_log.get("1.0", "end") if "log" in app.page_ready else "")
+check("miniatura: trocar de vídeo não gera erro interno", "(erro interno" not in _app_log and "doesn't exist" not in _app_log,
+      _app_log[-160:])
+app._fetch_thumb = real_fetch
+
+# análise que estoura no meio: precisa avisar e destravar, não ficar em "Analisando o link…"
+_calls2 = []
+_real_err = g.messagebox.showerror
+g.messagebox.showerror = lambda *a, **k: _calls2.append(a) or None
+_real_fill = app._fill_single
+app._fill_single = lambda info: (_ for _ in ()).throw(RuntimeError("falha de teste"))
+app.analyzing = True
+app.q.put(("info", "http://local/c", {"_type": "video", "title": "x"}))
+pump(0.5)
+app._fill_single = _real_fill
+g.messagebox.showerror = _real_err
+check("análise: erro interno destrava o botão Analisar",
+      app.btn_analyze.cget("state") == "normal" and txt(app.btn_analyze) == "Analisar",
+      f"{app.btn_analyze.cget('state')} {txt(app.btn_analyze)}")
+check("análise: erro interno avisa em vez de deixar 'Analisando o link…'",
+      txt(app.lbl_title) == "Falha ao analisar o link." and bool(_calls2), txt(app.lbl_title))
+check("análise: depois do erro interno a próxima análise funciona normalmente", not app.analyzing)
+app._on_info("http://local/d", {"_type": "video", "title": "De novo", "formats": []})
+check("análise: a tela volta a mostrar o resultado", txt(app.lbl_title) == "De novo", txt(app.lbl_title))
+
+# respostas de uma análise antiga (você apertou Enter de novo) são ignoradas
+app.analyze_try = 5
+app.analyzing = True
+app.btn_analyze.configure(state="disabled", text="Analisando…")
+app.q.put(("info", "http://local/e", {"_type": "video", "title": "Resposta velha", "formats": []}, 4))
+app.q.put(("info_error", "http://local/e", "erro velho", 4))
+pump(0.4)
+check("análise: resposta antiga não sobrescreve a análise atual", txt(app.lbl_title) == "De novo", txt(app.lbl_title))
+check("análise: erro antigo não destrava a análise atual", app.analyzing and txt(app.btn_analyze) == "Analisando…",
+      f"{app.analyzing} {txt(app.btn_analyze)}")
+app.analyzing = False
+app.analyze_try = 0
+app.btn_analyze.configure(state="normal", text="Analisar")
 
 # ------------------------------------------------------------ atualização automática do yt-dlp
 import hashlib  # noqa: E402

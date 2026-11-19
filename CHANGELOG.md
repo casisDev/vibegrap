@@ -7,6 +7,7 @@
 - As abas são montadas só quando abertas: o programa abre mais rápido e trocar de aba ficou mais leve.
 - Com a janela minimizada nada é redesenhado; a fila e o histórico se atualizam de uma vez quando você volta.
 - Aviso claro quando o navegador (Chrome, Brave ou Edge novos) não deixa ler os cookies por causa da criptografia DPAPI, com o passo a passo para usar um arquivo cookies.txt.
+- Corrigido: analisar um link depois de outro podia travar a tela em "Analisando o link…" e registrar `image "pyimage…" doesn't exist` no Registro. Agora a miniatura é limpa sem deixar uma imagem apagada, erros internos avisam e destravam o botão, e respostas de análises antigas são ignoradas.
 
 ## [2.2.0]
 

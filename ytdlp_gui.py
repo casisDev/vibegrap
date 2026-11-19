@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import traceback
 import urllib.request
 import webbrowser
 import zipfile
@@ -1104,6 +1105,9 @@ class App(ctk.CTk):
         self.pl_index = []
         self.warned_ffmpeg = False
         self.thumb_img = None
+        self.thumb_ph = None         # imagem transparente fixa: o rótulo da miniatura nunca fica sem imagem
+        self.analyzing = False        # há uma análise em andamento (para destravar a tela se ela falhar)
+        self.analyze_try = 0         # identifica a análise atual (respostas antigas são ignoradas)
         self.lists = []
         self.run_ids = set()
         self.running = False
@@ -2032,22 +2036,42 @@ class App(ctk.CTk):
         if not url:
             messagebox.showwarning("Atenção", "Cole um link primeiro.")
             return
+        self.analyze_try += 1
+        self.analyzing = True
         self.btn_analyze.configure(state="disabled", text="Analisando…")
         self.lbl_title.configure(text="Analisando o link…")
         self.lbl_meta.configure(text="Pode levar alguns segundos.")
         self.lbl_stats.configure(text="")
-        opts = self._base_opts()
+        try:
+            opts = self._base_opts()
+        except Exception as exc:  # noqa: BLE001
+            self._analyze_recover(exc)
+            return
         opts.update({"skip_download": True, "extract_flat": "in_playlist", "noplaylist": not self.v_playlist.get()})
-        threading.Thread(target=self._analyze_worker, args=(url, opts), daemon=True).start()
+        threading.Thread(target=self._analyze_worker, args=(url, opts, self.analyze_try), daemon=True).start()
 
-    def _analyze_worker(self, url, opts):
+    def _analyze_worker(self, url, opts, attempt=0):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 info = ydl.sanitize_info(info)
-            self.q.put(("info", url, info))
+            self.q.put(("info", url, info, attempt))
         except Exception as exc:  # noqa: BLE001
-            self.q.put(("info_error", url, str(exc)))
+            self.q.put(("info_error", url, str(exc), attempt))
+
+    def _analyze_recover(self, exc):
+        """A análise não pôde ser mostrada (erro interno): destrava a tela em vez de ficar em “Analisando…”."""
+        self.analyzing = False
+        self.btn_analyze.configure(state="normal", text="Analisar")
+        self.lbl_title.configure(text="Falha ao analisar o link.")
+        self.lbl_meta.configure(text=short(str(exc), 160) or "Erro interno na interface.")
+        self.v_status.set("Erro interno na interface. Veja a aba Registro.")
+        self._log(f"Erro interno ao analisar: {exc}")
+        messagebox.showerror(
+            "Não foi possível analisar",
+            "A análise não pôde ser mostrada por um erro interno:\n\n"
+            f"{short(str(exc), 220)}\n\nTente analisar de novo. Se repetir, veja as últimas linhas da aba Registro.",
+        )
 
     def _fetch_thumb(self, url):
         try:
@@ -2058,20 +2082,45 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def _thumb_placeholder(self):
+        """Imagem transparente que nunca é descartada: o rótulo sempre aponta para uma imagem viva."""
+        if self.thumb_ph is None and Image is not None:
+            empty = Image.new("RGBA", (176, 99), (0, 0, 0, 0))
+            self.thumb_ph = ctk.CTkImage(light_image=empty, dark_image=empty, size=(176, 99))
+        return self.thumb_ph
+
+    def _thumb_clear(self):
+        """Volta para “Sem miniatura” sem deixar o rótulo com uma imagem já apagada.
+
+        O CTkLabel não remove a imagem do Tk quando recebe image=None. Se a imagem antiga for
+        descartada, o próximo configure() estoura “image ... doesn't exist” e a análise trava."""
+        ph = self._thumb_placeholder()
+        try:
+            self.lbl_thumb.configure(image=ph, text="Sem\nminiatura")
+        except tk.TclError:
+            # rótulo preso a uma imagem apagada: limpa direto no widget do Tk e tenta de novo
+            self.lbl_thumb._label.configure(image="")
+            self.lbl_thumb.configure(image=ph, text="Sem\nminiatura")
+        self.thumb_img = None
+
     def _set_thumb(self, data):
         if Image is None:
             return
         try:
             img = Image.open(io.BytesIO(data)).convert("RGB")
             img = ImageOps.fit(img, (352, 198), Image.LANCZOS)
-            self.thumb_img = ctk.CTkImage(light_image=img, dark_image=img, size=(176, 99))
-            self.lbl_thumb.configure(image=self.thumb_img, text="")
-        except Exception:
-            pass
+            thumb = ctk.CTkImage(light_image=img, dark_image=img, size=(176, 99))
+            self.lbl_thumb.configure(image=thumb, text="")
+            self.thumb_img = thumb  # só solta a antiga depois de a tela apontar para a nova
+        except Exception:  # noqa: BLE001
+            self._thumb_clear()
 
-    def _on_info(self, url, info):
+    def _on_info(self, url, info, attempt=None):
+        if attempt is not None and attempt != self.analyze_try:
+            return  # resposta de uma análise antiga: a atual ainda está valendo
         self.btn_analyze.configure(state="normal", text="Analisar")
         if not info:
+            self.analyzing = False
             self.lbl_title.configure(text="Não foi possível obter informações desse link.")
             return
         self.info = info
@@ -2081,8 +2130,7 @@ class App(ctk.CTk):
         self.pl_items.clear()
         self.audio_langs, self.sub_items, self.pl_index = [], [], []
         self._pl_count()
-        self.lbl_thumb.configure(image=None, text="Sem\nminiatura")
-        self.thumb_img = None
+        self._thumb_clear()
         thumb = info.get("thumbnail")
         if thumb and Image is not None:
             threading.Thread(target=self._fetch_thumb, args=(thumb,), daemon=True).start()
@@ -2091,6 +2139,7 @@ class App(ctk.CTk):
             self._fill_playlist(info)
         else:
             self._fill_single(info)
+        self.analyzing = False
 
     def _fill_single(self, info):
         formats = info.get("formats") or []
@@ -2643,6 +2692,16 @@ class App(ctk.CTk):
             self._stat("eta", "—")
 
     # ------------------------------------------------------------ fila de mensagens (threads -> interface)
+    def _ui_error(self, exc):
+        """Erro inesperado na interface: registra e nunca deixa a análise presa em “Analisando…”."""
+        self._log(f"(erro interno na interface: {exc})")
+        where = traceback.extract_tb(exc.__traceback__)
+        if where:
+            last = where[-1]
+            self._log(f"  em {os.path.basename(last.filename)}:{last.lineno} ({last.name})")
+        if self.analyzing:
+            self._analyze_recover(exc)
+
     def _pump(self):
         dirty = False
         rows = set()
@@ -2666,8 +2725,11 @@ class App(ctk.CTk):
                         rows.add(msg[1])
                         dirty = True
                     elif kind == "info":
-                        self._on_info(msg[1], msg[2])
+                        self._on_info(msg[1], msg[2], msg[3] if len(msg) > 3 else None)
                     elif kind == "info_error":
+                        if len(msg) > 3 and msg[3] != self.analyze_try:
+                            continue  # erro de uma análise antiga: a atual ainda está valendo
+                        self.analyzing = False
                         self.btn_analyze.configure(state="normal", text="Analisar")
                         self.lbl_title.configure(text="Falha ao analisar o link.")
                         self.lbl_meta.configure(text=short(msg[2], 160))
@@ -2703,14 +2765,23 @@ class App(ctk.CTk):
                     elif kind == "ytdlp":
                         self._on_ytdlp_msg(msg)
                 except Exception as exc:  # noqa: BLE001
-                    self._log(f"(erro interno na interface: {exc})")
+                    self._ui_error(exc)
         except queue.Empty:
             pass
-        self.dirty_rows |= rows
-        if dirty:
-            self.dirty_total = True
-        self._flush_ui()
-        self.after(80, self._pump)
+        except Exception as exc:  # noqa: BLE001
+            self._ui_error(exc)
+        finally:
+            try:
+                self.dirty_rows |= rows
+                if dirty:
+                    self.dirty_total = True
+                self._flush_ui()
+            except Exception as exc:  # noqa: BLE001
+                self._ui_error(exc)
+            try:
+                self.after(80, self._pump)
+            except tk.TclError:  # janela já fechada
+                pass
 
     def _flush_ui(self):
         """Aplica na tela o que mudou. Com a janela minimizada nada é desenhado: os pedidos
