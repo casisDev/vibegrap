@@ -14,6 +14,7 @@ Interface gráfica moderna, em português, para o [yt-dlp](https://github.com/yt
 
 - Análise do link com miniatura, título, duração e **tamanho estimado** antes de baixar
 - Vídeo (MP4, MKV, WEBM, até 4K) ou só áudio (MP3, M4A, Opus, FLAC, WAV ou o original)
+- **MP4 que abre em qualquer lugar:** o vídeo em MP4 é ajustado para **H.264 + AAC** (o padrão do WhatsApp, de TVs e de celulares), mesmo quando o site só oferece HEVC, VP9 ou AV1; vídeos mudos ganham uma faixa de áudio silenciosa. Escolha MKV/WEBM para manter o codec original.
 - **Escolha da faixa de áudio** (uma ou várias dublagens no mesmo arquivo)
 - Legendas manuais e automáticas, para embutir no vídeo ou guardar à parte
 - Trecho do vídeo (início/fim), com opção de corte preciso
@@ -107,10 +108,11 @@ python ytdlp_gui.py
 ## Se algo não funcionar
 
 - **O YouTube não baixa / erro de “challenge” ou assinatura:** abra **Ferramentas → Atualizar o yt-dlp** e reabra o programa; se persistir, baixe ali mesmo o **Deno** (os sites mudam com frequência).
+- **TikTok ou Instagram recusam o link:** atualize o yt-dlp em **Ferramentas** e tente de novo. O Instagram costuma exigir login: use os **cookies do navegador** em **Configurações** (no TikTok eles também ajudam).
 - **Vídeo com login ou restrição de idade:** use o **Firefox** logado em **Configurações → Cookies do navegador**, ou exporte um **`cookies.txt`** (extensão “Get cookies.txt LOCALLY”) e escolha o arquivo em **Configurações → “ou arquivo cookies.txt”**. Chrome, Brave e Edge novos protegem os cookies (DPAPI) e o yt-dlp não consegue lê-los.
 - **“ffmpeg não encontrado”:** abra **Ferramentas → Baixar / atualizar ffmpeg**.
 - **A playlist baixou só um vídeo:** cole o link, clique em **Analisar** e marque os itens; sem analisar, o programa trata o link como vídeo único.
-- **O arquivo não abre na TV ou no celular:** quase sempre é o codec (AV1/VP9). Baixar em 1080p ou menos costuma gerar H.264, mais compatível.
+- **O arquivo não abre na TV, no celular ou o WhatsApp diz “formato não suportado”:** baixe em **MP4** — o programa converte o que for preciso para H.264 + AAC. A conversão pode demorar um pouco em vídeos longos; em **MKV/WEBM** o codec original é mantido.
 - **Detalhes de qualquer erro:** página **Registro**.
 - **Onde ficam as coisas:** ajustes e histórico ficam em `%APPDATA%\VibeGrap`; os vídeos vão para a pasta escolhida no programa.
 

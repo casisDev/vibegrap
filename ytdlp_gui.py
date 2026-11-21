@@ -331,6 +331,130 @@ def detect_js_runtime():
     return None
 
 
+WHATSAPP_EXTS = (".mp4", ".m4v", ".mov")
+WHATSAPP_PIX_FMTS = ("yuv420p", "yuvj420p")
+
+
+def _no_window():
+    """Impede que o ffmpeg/ffprobe abram uma janela de console no Windows."""
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+
+
+def probe_media_streams(path, ffprobe=None):
+    """Faixas (streams) do arquivo segundo o ffprobe; None se não der para conferir."""
+    exe = ffprobe or find_tool("ffprobe")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "-v", "error", "-show_streams", "-of", "json", path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, **_no_window(),
+        )
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout or "{}").get("streams") or []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _primary_video(streams):
+    for s in streams or []:
+        if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic"):
+            return s
+    return None
+
+
+def _aac_lc(stream):
+    return (stream.get("codec_name") or "").lower() == "aac" and (stream.get("profile") or "LC").upper() == "LC"
+
+
+def whatsapp_problem(streams):
+    """O que impede o arquivo de ser aceito no WhatsApp; None quando já é H.264/AAC."""
+    video = _primary_video(streams)
+    if video is None:
+        return None
+    problems = []
+    vcodec = (video.get("codec_name") or "").lower()
+    if vcodec != "h264" or (video.get("pix_fmt") or "").lower() not in WHATSAPP_PIX_FMTS:
+        problems.append("vídeo " + (vcodec or "desconhecido"))
+    audio = [s for s in streams or [] if s.get("codec_type") == "audio"]
+    if not audio:
+        problems.append("sem áudio")
+    elif not all(_aac_lc(s) for s in audio):
+        names = ", ".join(sorted({(s.get("codec_name") or "?").upper() for s in audio}))
+        problems.append("áudio " + names)
+    return ", ".join(problems) or None
+
+
+def make_whatsapp_compatible(path, ffmpeg=None, ffprobe=None, log=None, should_stop=None):
+    """Deixa o vídeo no padrão que o WhatsApp aceita: MP4 H.264 (yuv420p) + AAC-LC.
+
+    Só mexe no arquivo quando precisa (HEVC/VP9/AV1, áudio diferente de AAC-LC ou
+    nenhuma faixa de áudio). Devolve (mudou, mensagem).
+    """
+    streams = probe_media_streams(path, ffprobe)
+    if streams is None:
+        return False, "Não foi possível conferir as faixas do vídeo (ffprobe indisponível)."
+    problem = whatsapp_problem(streams)
+    if not problem:
+        return False, ""
+    exe = ffmpeg or find_tool("ffmpeg")
+    if not exe:
+        return False, "O ffmpeg não foi encontrado; o vídeo ficou no formato original."
+
+    video = _primary_video(streams)
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    video_ok = (video.get("codec_name") or "").lower() == "h264" and (video.get("pix_fmt") or "").lower() in WHATSAPP_PIX_FMTS
+    audio_ok = bool(audio) and all(_aac_lc(s) for s in audio)
+
+    args = [exe, "-y", "-hide_banner", "-loglevel", "error", "-i", path]
+    if not audio:  # vídeo mudo: acrescenta uma faixa silenciosa, senão o WhatsApp recusa
+        args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+    args += ["-map", f"0:{int(video.get('index', 0))}"]
+    args += ["-map", "0:a?"] if audio else ["-map", "1:a:0"]
+    if any(s.get("codec_type") == "subtitle" for s in streams):
+        args += ["-map", "0:s?", "-c:s", "copy"]
+    args += ["-map_metadata", "0", "-map_chapters", "0"]
+    if video_ok:
+        args += ["-c:v", "copy"]
+    else:
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-profile:v", "high"]
+    args += ["-c:a", "copy"] if audio_ok else ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+    if not audio:
+        args += ["-shortest"]
+    args += ["-movflags", "+faststart"]
+
+    fd, tmp = tempfile.mkstemp(prefix=".vibegrap-", suffix=".mp4", dir=os.path.dirname(path) or ".")
+    os.close(fd)
+    args.append(tmp)
+    if log:
+        log(f"Preparando o vídeo para o WhatsApp ({problem}): convertendo para H.264/AAC…")
+    err = b""
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **_no_window())
+        while True:
+            try:
+                _, err = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if should_stop and should_stop():
+                    proc.kill()
+                    proc.communicate()
+                    raise Cancelado()
+        if proc.returncode != 0:
+            detail = short((err or b"").decode("utf-8", "replace").strip(), 300)
+            return False, "Não foi possível converter o vídeo para o formato do WhatsApp." + ((" " + detail) if detail else "")
+        os.replace(tmp, path)
+        tmp = ""
+        return True, "Vídeo salvo em MP4 H.264/AAC (o formato que o WhatsApp aceita)."
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def build_format(mode, height, exact_langs, lang_prefix, can_merge=True):
     """Monta a string de formato do yt-dlp. Retorna (formato, várias_faixas_de_áudio)."""
     h = f"[height<={height}]" if height else ""
@@ -704,6 +828,11 @@ ERROR_RULES = [
      "O ffmpeg não foi encontrado ou falhou. Abra Ferramentas e use “Baixar / atualizar ffmpeg”."),
     (r"js runtime|javascript runtime|n challenge|signature solving|no video formats found",
      "O YouTube exige um runtime JavaScript. Abra Ferramentas e baixe o Deno; depois atualize o yt-dlp."),
+    (r"empty media response|instagram api is not granting access",
+     "O Instagram não liberou este post sem login. Em Configurações → Cookies do navegador, escolha o navegador "
+     "onde você está logado no Instagram e tente de novo."),
+    (r"unable to extract webpage video data|failed to parse json|could not find any video",
+     "O site mudou a página e o yt-dlp não conseguiu ler o vídeo. Atualize o yt-dlp em Ferramentas e tente de novo."),
     (r"getaddrinfo|name or service not known|temporary failure in name resolution|network is unreachable|"
      r"timed out|timeout|connection (reset|refused|aborted)|remote end closed|urlopen error|unable to download webpage|"
      r"unable to connect|failed to resolve|ssl",
@@ -839,6 +968,31 @@ def open_folder(path):
 
 class Cancelado(Exception):
     pass
+
+
+class CompatMP4PP(yt_dlp.postprocessor.PostProcessor):
+    """Depois do download, garante um MP4 H.264/AAC (o formato que o WhatsApp aceita)."""
+
+    def __init__(self, downloader=None, should_stop=None):
+        super().__init__(downloader)
+        self._should_stop = should_stop
+
+    def run(self, info):
+        path = info.get("filepath") or ""
+        if not path.lower().endswith(WHATSAPP_EXTS) or not os.path.isfile(path):
+            return [], info
+        try:
+            changed, msg = make_whatsapp_compatible(path, log=self.to_screen, should_stop=self._should_stop)
+        except Cancelado:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.report_warning(f"Não foi possível preparar o vídeo para o WhatsApp: {exc}")
+            return [], info
+        if changed:
+            self.to_screen(msg)
+        elif msg:
+            self.report_warning(msg)
+        return [], info
 
 
 class QLogger:
@@ -1457,6 +1611,9 @@ class App(ctk.CTk):
             om = menu(col, var, values, width=width, command=(lambda _v, c=cmd: c() if c else None))
             om.pack(anchor="w", pady=(2, 0))
             setattr(self, attr, om)
+
+        lbl(tab, "MP4 fica em H.264/AAC (compatível com WhatsApp, TVs e celulares); MKV/WEBM mantêm o codec original.",
+            muted=True, size=12).pack(anchor="w", pady=(0, 4))
 
         lbl(tab, "Faixas de áudio (idiomas / dublagens)", bold=True).pack(anchor="w", pady=(6, 2))
         row = ctk.CTkFrame(tab, fg_color="transparent")
@@ -2278,6 +2435,7 @@ class App(ctk.CTk):
 
         pps = []
         notes = []
+        compat = False  # MP4 de vídeo: depois do download garantimos H.264/AAC (WhatsApp)
 
         # --- áudio / vídeo
         if mode == "audio":
@@ -2297,7 +2455,11 @@ class App(ctk.CTk):
                 container = "mkv"
                 self._log("Várias faixas de áudio: contêiner alterado para MKV.")
             opts["merge_output_format"] = container
-            notes.append(f"{qtxt if height else 'Melhor'} {container.upper()}")
+            compat = bool(have_ff and container == "mp4")
+            if compat:
+                notes.append(f"{qtxt if height else 'Melhor'} MP4 (H.264/AAC)")
+            else:
+                notes.append(f"{qtxt if height else 'Melhor'} {container.upper()}")
         if multi:
             opts["allow_multiple_audio_streams"] = True
         if exact:
@@ -2378,7 +2540,8 @@ class App(ctk.CTk):
         title = title or url
         if is_playlist:
             title = f"[Playlist] {title}"
-        return {"url": url, "title": title, "desc": " · ".join(notes), "opts": opts, "playlist": is_playlist, "est": est}
+        return {"url": url, "title": title, "desc": " · ".join(notes), "opts": opts, "playlist": is_playlist,
+                "est": est, "compat": compat}
 
     # ------------------------------------------------------------ fila
     def _reset_progress(self, item):
@@ -2499,6 +2662,8 @@ class App(ctk.CTk):
             error = ""
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
+                    if item.get("compat"):
+                        ydl.add_post_processor(CompatMP4PP(ydl, should_stop=self.cancel.is_set), when="after_move")
                     code = ydl.download([item["url"]])
                 if code:
                     item["status"] = "Concluído com avisos" if item.get("playlist") else "Erro"

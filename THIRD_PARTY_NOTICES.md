@@ -28,6 +28,9 @@ Este arquivo lista o que é usado, sob qual licença e onde obter o código-font
 | brotli | MIT | https://github.com/google/brotli |
 | websockets | BSD-3-Clause | https://github.com/python-websockets/websockets |
 | certifi | MPL-2.0 | https://github.com/certifi/python-certifi |
+| curl_cffi | MIT (© lexiforest) | https://github.com/lexiforest/curl_cffi |
+| cffi | MIT | https://github.com/python-cffi/cffi |
+| pycparser | BSD-3-Clause | https://github.com/eliben/pycparser |
 | requests | Apache 2.0 | https://github.com/psf/requests |
 | urllib3 | MIT | https://github.com/urllib3/urllib3 |
 | darkdetect | BSD-3-Clause | https://github.com/albertosottile/darkdetect |

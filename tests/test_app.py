@@ -8,6 +8,7 @@ import functools
 import http.server
 import importlib.util
 import io
+import json
 import os
 import queue
 import shutil
@@ -118,6 +119,24 @@ check("tamanho: desconhecido -> None", g.estimate_size(nosize, "b/b", False) is 
 tbr_only = {"formats": [mk("n1", height=480, vcodec="avc1", acodec="mp4a", tbr=800)], "duration": 10}
 check("tamanho: por bitrate (800 kbps x 10 s)", g.estimate_size(tbr_only, "b/b", False) == 1_000_000, g.estimate_size(tbr_only, "b/b", False))
 check("tamanho: sem formatos -> None", g.estimate_size({"formats": []}, "b", False) is None)
+
+# ------------------------------------------------------------ compatibilidade com o WhatsApp
+WV = {"index": 0, "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}
+WA = {"index": 1, "codec_type": "audio", "codec_name": "aac", "profile": "LC"}
+check("whatsapp: H.264 + AAC-LC já é compatível", g.whatsapp_problem([WV, WA]) is None, g.whatsapp_problem([WV, WA]))
+check("whatsapp: HEVC precisa converter", "hevc" in (g.whatsapp_problem([dict(WV, codec_name="hevc"), WA]) or ""),
+      g.whatsapp_problem([dict(WV, codec_name="hevc"), WA]))
+check("whatsapp: 10 bits precisa converter",
+      g.whatsapp_problem([dict(WV, pix_fmt="yuv420p10le"), WA]) is not None,
+      g.whatsapp_problem([dict(WV, pix_fmt="yuv420p10le"), WA]))
+check("whatsapp: vídeo mudo é completado", "sem áudio" in (g.whatsapp_problem([WV]) or ""), g.whatsapp_problem([WV]))
+check("whatsapp: HE-AAC precisa converter",
+      "áudio" in (g.whatsapp_problem([WV, dict(WA, profile="HE-AAC")]) or ""),
+      g.whatsapp_problem([WV, dict(WA, profile="HE-AAC")]))
+check("whatsapp: capa embutida (attached_pic) não conta como vídeo",
+      g.whatsapp_problem([{"index": 0, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+                          dict(WV, index=1), dict(WA, index=2)]) is None)
+check("whatsapp: sem vídeo não é problema de conversão", g.whatsapp_problem([WA]) is None)
 
 # ------------------------------------------------------------ nomes de arquivo
 single = {"id": "abc", "title": "Meu Vídeo", "ext": "mp4", "uploader": "Canal", "playlist_title": None, "playlist_index": None}
@@ -235,6 +254,8 @@ item = app._build_item(URL)
 check("item: criado", item is not None)
 o = item["opts"]
 check("item: formato", o["format"].startswith("bv*[height<=720]+ba[language=pt-BR]"), o["format"])
+check("item: MP4 garante H.264/AAC (WhatsApp)", item["compat"] and "H.264/AAC" in item["desc"],
+      (item.get("compat"), item["desc"]))
 check("item: legendas", o["subtitleslangs"] == ["pt", "es"] and o["writesubtitles"] and o["writeautomaticsub"], o.get("subtitleslangs"))
 check("item: trecho", "download_ranges" in o)
 check("item: limite 2M", o["ratelimit"] == 2 * 1024 * 1024, o.get("ratelimit"))
@@ -245,7 +266,8 @@ check("item: yt-dlp aceita as opções", True)
 
 app.pl_audio.lb.select_set(app.audio_langs.index("en"))
 item2 = app._build_item(URL)
-check("item: várias faixas força mkv", item2["opts"].get("merge_output_format") == "mkv" and item2["opts"].get("allow_multiple_audio_streams"))
+check("item: várias faixas força mkv", item2["opts"].get("merge_output_format") == "mkv" and item2["opts"].get("allow_multiple_audio_streams")
+      and not item2["compat"])
 app.v_start.set("")
 app.v_end.set("")
 
@@ -416,8 +438,43 @@ subprocess.run(
     ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=15", "-f", "lavfi",
      "-i", "sine=frequency=440:duration=6", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
      "-movflags", "+faststart", os.path.join(media, "clip.mp4")], check=True)
+subprocess.run(  # vídeo mudo: o WhatsApp recusa arquivos sem faixa de áudio
+    ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", os.path.join(media, "sem-audio.mp4")], check=True)
 with open(os.path.join(media, "big.mp4"), "wb") as f:
     f.write(os.urandom(6 * 1024 * 1024))
+
+
+def streams_of(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", path],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        return json.loads(r.stdout or "{}").get("streams") or []
+    except ValueError:
+        return []
+
+
+def kinds_of(path):
+    return sorted((s.get("codec_type"), s.get("codec_name")) for s in streams_of(path))
+
+
+silent_test = os.path.join(TMP, "mudo.mp4")
+subprocess.run(
+    ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10",
+     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", silent_test], check=True)
+check("conversão: vídeo mudo ganha AAC-LC e continua H.264",
+      g.make_whatsapp_compatible(silent_test)[0]
+      and kinds_of(silent_test) == [("audio", "aac"), ("video", "h264")],
+      kinds_of(silent_test))
+check("conversão: arquivo já compatível não é mexido", g.make_whatsapp_compatible(os.path.join(media, "clip.mp4")) == (False, ""))
+old_codec = os.path.join(TMP, "mpeg4.mp4")
+subprocess.run(
+    ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=10", "-f", "lavfi",
+     "-i", "sine=frequency=440:duration=2", "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+     old_codec], check=True)
+check("conversão: MPEG-4 vira H.264/AAC",
+      g.make_whatsapp_compatible(old_codec)[0]
+      and kinds_of(old_codec) == [("audio", "aac"), ("video", "h264")], kinds_of(old_codec))
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -515,6 +572,18 @@ if files:
         pass
 check("E2E trecho: ~2s", app.items[iid]["status"] == "Concluído" and dur is not None and 1.5 <= dur <= 3.0, f"{app.items[iid]['status']} dur={dur} {files}")
 app.v_start.set(""); app.v_end.set("")
+
+out6 = os.path.join(TMP, "out6")
+app.v_folder.set(out6)
+app.v_container.set("mp4")
+set_url(BASE + "/sem-audio.mp4")
+iid = app._add_clicked()
+run_queue()
+files = os.listdir(out6) if os.path.isdir(out6) else []
+kinds = kinds_of(os.path.join(out6, files[0])) if files else []
+check("E2E compatível: vídeo mudo baixado já sai com AAC (WhatsApp)",
+      app.items[iid]["status"] == "Concluído" and ("audio", "aac") in kinds and ("video", "h264") in kinds,
+      (app.items[iid]["status"], files, kinds))
 
 out4 = os.path.join(TMP, "out4")
 app.v_folder.set(out4)
@@ -1125,6 +1194,11 @@ check("erro: DPAPI não é confundido com restrição de idade",
 check("erro: disco cheio e permissão", "disco" in FE("[Errno 28] No space left on device") and "permissão" in FE("[Errno 13] Permission denied: 'x'"))
 check("erro: formato indisponível", "Melhor disponível" in FE("ERROR: Requested format is not available"))
 check("erro: link não suportado", "suportado" in FE("ERROR: Unsupported URL: https://example.com/x"))
+check("erro: TikTok com página mudada pede para atualizar o yt-dlp",
+      "Atualize o yt-dlp" in FE("ERROR: [TikTok] 770: Unable to extract webpage video data"), FE("ERROR: [TikTok] 770: Unable to extract webpage video data"))
+check("erro: Instagram sem login pede os cookies do navegador",
+      "Instagram" in FE("ERROR: [Instagram] abc: Instagram sent an empty media response. Check if this post is accessible"),
+      FE("ERROR: [Instagram] abc: Instagram sent an empty media response"))
 check("erro: desconhecido mostra o texto limpo", FE("\x1b[0;31mERROR:\x1b[0m [x] 12: algo estranho") == "algo estranho", FE("\x1b[0;31mERROR:\x1b[0m [x] 12: algo estranho"))
 check("erro: vazio tem mensagem padrão", "Registro" in FE(""))
 check("erro: nunca vaza código de cor", "\x1b" not in FE("\x1b[31mHTTP Error 404: Not Found\x1b[0m"))
