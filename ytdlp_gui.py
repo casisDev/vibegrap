@@ -922,6 +922,48 @@ def friendly_error(text):
     return short(raw, 220) if raw else "Falhou por um motivo desconhecido. Veja o Registro."
 
 
+# ---------------------------------------------------------------- ajuda de cookies
+# (tipo, texto) para o navegador escolhido em Configurações: se o yt-dlp consegue ler
+# os cookies dele. Chrome, Edge e Brave novos usam uma criptografia (DPAPI) que ele abre.
+DPAPI_BROWSERS = ("chrome", "edge", "brave")
+CHROMIUM_BROWSERS = ("opera", "vivaldi", "chromium")
+
+COOKIES_EXT_CHROME = "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
+COOKIES_EXT_FIREFOX = "https://addons.mozilla.org/firefox/addon/get-cookiestxt-locally"
+
+COOKIE_STEPS = (
+    "Como dar ao programa os cookies de um site (YouTube, Facebook, Instagram...):\n\n"
+    "1) Instale a extensão “Get cookies.txt LOCALLY” no navegador em que você está logado "
+    "(os botões abaixo abrem a página da extensão).\n"
+    "2) Abra o site e faça login normalmente.\n"
+    "3) Clique no ícone da extensão e escolha Export: baixa um arquivo cookies.txt.\n"
+    "4) Aqui no VibeGrap: Configurações → “ou arquivo cookies.txt” → “Escolher…” e selecione o arquivo.\n"
+    "5) Clique em “Testar acesso ao site…” e teste o link que falhou.\n\n"
+    "Alternativa sem extensão: em “Cookies do navegador”, escolha o Firefox logado no site — "
+    "ele deixa o yt-dlp ler os cookies direto.\n\n"
+    "Atenção: o arquivo cookies.txt dá acesso à sua conta. Guarde só no seu computador, não "
+    "compartilhe e apague quando não precisar mais."
+)
+
+
+def browser_cookie_hint(browser):
+    """(tipo, texto) — se o navegador escolhido deixa o yt-dlp ler os cookies e o que fazer."""
+    name = str(browser or "").strip()
+    low = name.lower()
+    if low in ("", "nenhum"):
+        return ("off", "Sem cookies: só vídeos públicos vão funcionar. Para login ou restrição de idade, "
+                       "escolha o navegador onde você está logado ou use um arquivo cookies.txt.")
+    if low in ("firefox", "safari"):
+        return ("ok", f"{name}: os cookies são lidos direto — funciona para login e restrição de idade.")
+    if low in DPAPI_BROWSERS:
+        return ("warn", f"{name} (versões novas) protege os cookies com uma criptografia (DPAPI) que o yt-dlp "
+                        "pode não abrir. Se der erro de cookies, use o Firefox ou exporte um cookies.txt.")
+    if low in CHROMIUM_BROWSERS:
+        return ("warn", f"{name} é do Chromium e pode proteger os cookies. Se der erro de cookies, "
+                        "use o Firefox ou exporte um cookies.txt.")
+    return ("warn", f"Não sei se {name} deixa ler os cookies: se der erro, use o Firefox ou exporte um cookies.txt.")
+
+
 # ---------------------------------------------------------------- histórico
 def load_history(path=None):
     try:
@@ -1952,7 +1994,9 @@ class App(ctk.CTk):
         row(1, "Nome do arquivo", lambda p: menu(p, self.v_template, list(TEMPLATES), width=240))
         row(2, "Limite de velocidade", lambda p: entry(p, self.v_limit, width=160), "ex.: 500K, 2M")
         row(3, "Proxy", lambda p: entry(p, self.v_proxy), "ex.: http://127.0.0.1:8080")
-        row(4, "Cookies do navegador", lambda p: menu(p, self.v_browser, BROWSERS, width=160), "para login ou restrição de idade")
+        row(4, "Cookies do navegador",
+            lambda p: menu(p, self.v_browser, BROWSERS, width=160, command=self._on_browser_pick),
+            "para login ou restrição de idade")
 
         def cookie_row(p):
             f = ctk.CTkFrame(p, fg_color="transparent")
@@ -1962,12 +2006,14 @@ class App(ctk.CTk):
             return f
 
         row(5, "ou arquivo cookies.txt", cookie_row, "funciona com qualquer navegador")
-        lbl(
-            wrap,
-            "Chrome, Brave e Edge novos guardam os cookies protegidos (DPAPI) e o yt-dlp não consegue lê-los: "
-            "nesses casos use o arquivo cookies.txt, exportado pela extensão “Get cookies.txt LOCALLY”, ou o Firefox.",
-            muted=True, size=12, anchor="w", justify="left", wraplength=760,
-        ).pack(anchor="w", padx=18, pady=(0, 6))
+        self.lbl_ckhint = lbl(wrap, "", muted=True, size=12, anchor="w", justify="left", wraplength=760)
+        self.lbl_ckhint.pack(anchor="w", padx=18, pady=(0, 4))
+        self._refresh_cookie_hint()
+
+        ckacts = ctk.CTkFrame(wrap, fg_color="transparent")
+        ckacts.pack(fill="x", padx=18, pady=(0, 6))
+        btn(ckacts, "Testar acesso ao site…", self._test_cookies_dialog, "primary").pack(side="left")
+        btn(ckacts, "Como exportar cookies.txt…", self._cookies_help_dialog, "soft").pack(side="left", padx=(8, 0))
 
         c = card(wrap)
         c.pack(fill="x", pady=6)
@@ -2144,6 +2190,129 @@ class App(ctk.CTk):
         path = filedialog.askopenfilename(filetypes=[("cookies.txt", "*.txt"), ("Todos", "*.*")])
         if path:
             self.v_cookiefile.set(path)
+
+    # ------------------------------------------------------------ ajuda de cookies
+    def _on_browser_pick(self, _value=None):
+        """Mostra embaixo do menu se o navegador escolhido deixa ler os cookies (DPAPI)."""
+        self._save_cfg()
+        self._refresh_cookie_hint()
+
+    def _refresh_cookie_hint(self):
+        if not getattr(self, "lbl_ckhint", None):
+            return
+        kind, text = browser_cookie_hint(self.v_browser.get())
+        color = {"ok": TXT, "warn": RED, "off": MUTED}.get(kind, MUTED)
+        self.lbl_ckhint.configure(text=text, text_color=color)
+
+    def _test_cookies_dialog(self):
+        """Janela para testar se os cookies atuais dão acesso ao site que recusou o link."""
+        win = getattr(self, "ck_win", None)
+        if win is not None and win.winfo_exists():
+            win.focus()
+            return
+        win = self.ck_win = ctk.CTkToplevel(self, fg_color=BG)
+        win.title("Testar acesso ao site")
+        win.geometry("620x430")
+        win.transient(self)
+        inner = ctk.CTkFrame(win, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=18, pady=16)
+        lbl(inner, "Testar acesso ao site", bold=True, size=17).pack(anchor="w")
+        lbl(inner, "O programa tenta ler o vídeo com os cookies atuais e diz se o site liberou.",
+            muted=True, size=12, wraplength=560, justify="left").pack(anchor="w", pady=(2, 8))
+        self.v_ckurl = tk.StringVar(value=self._url() or (self.info or {}).get("webpage_url", ""))
+        rowf = ctk.CTkFrame(inner, fg_color="transparent")
+        rowf.pack(fill="x")
+        rowf.columnconfigure(0, weight=1)
+        entry(rowf, self.v_ckurl).grid(row=0, column=0, sticky="ew")
+        self.btn_cktest = btn(rowf, "Testar", self._run_cookie_test, "primary", width=110)
+        self.btn_cktest.grid(row=0, column=1, padx=(8, 0))
+        self.lbl_ckresult = lbl(inner, "", size=13, wraplength=560, justify="left", anchor="nw")
+        self.lbl_ckresult.pack(fill="both", expand=True, pady=(10, 0))
+        btn(inner, "Fechar", win.destroy, "ghost", width=100).pack(anchor="e", pady=(6, 0))
+        win.after(150, win.focus)
+
+    def _run_cookie_test(self):
+        url = normalize_url(self.v_ckurl.get())
+        if not url:
+            messagebox.showwarning("Atenção", "Cole o link do vídeo primeiro.")
+            return
+        try:
+            opts = self._base_opts()
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_ckresult.configure(text=short(str(exc), 200), text_color=RED)
+            return
+        opts.update({"skip_download": True, "noplaylist": True})
+        self.btn_cktest.configure(state="disabled", text="Testando…")
+        self.lbl_ckresult.configure(text="Tentando ler o vídeo…", text_color=MUTED)
+        threading.Thread(target=self._cookie_test_worker, args=(url, opts), daemon=True).start()
+
+    def _cookie_test_worker(self, url, opts):
+        def tentar(o):
+            with yt_dlp.YoutubeDL(o) as ydl:
+                return ydl.sanitize_info(ydl.extract_info(url, download=False)) or {}
+
+        try:
+            info = tentar(opts)
+        except Exception as exc:  # noqa: BLE001
+            target = impersonate_target()
+            if target and needs_impersonate_retry(url, exc):
+                try:
+                    info = tentar(dict(opts, impersonate=target))
+                except Exception as exc2:  # noqa: BLE001
+                    self.q.put(("cookietest", False, str(exc2)))
+                    return
+            else:
+                self.q.put(("cookietest", False, str(exc)))
+                return
+        self.q.put(("cookietest", True, str(info.get("title") or "vídeo")))
+
+    def _on_cookie_test(self, msg):
+        ok, detail = bool(msg[1]), str(msg[2])
+        if getattr(self, "btn_cktest", None) is None or not self.btn_cktest.winfo_exists():
+            return
+        self.btn_cktest.configure(state="normal", text="Testar")
+        if ok:
+            self.lbl_ckresult.configure(
+                text=f"✅ Liberou: “{short(detail, 70)}”. Os cookies atuais funcionam para este site.",
+                text_color=TXT,
+            )
+            self._log(f"Teste de cookies: acesso liberado ({detail})")
+            return
+        text = friendly_error(detail)
+        if cookie_error(detail):
+            text += "\n\n" + COOKIE_HELP
+        else:
+            kind, hint = browser_cookie_hint(self.v_browser.get())
+            if kind == "warn":
+                text += "\n\n" + hint
+        self.lbl_ckresult.configure(text="❌ " + text, text_color=RED)
+        self._log("Teste de cookies: falhou — " + clean_error(detail))
+
+    def _cookies_help_dialog(self):
+        """Passo a passo para exportar um cookies.txt, com botões para abrir a extensão."""
+        win = getattr(self, "ckhelp_win", None)
+        if win is not None and win.winfo_exists():
+            win.focus()
+            return
+        win = self.ckhelp_win = ctk.CTkToplevel(self, fg_color=BG)
+        win.title("Como exportar cookies.txt")
+        win.geometry("660x520")
+        win.transient(self)
+        box = ctk.CTkFrame(win, fg_color="transparent")
+        box.pack(fill="both", expand=True, padx=18, pady=16)
+        lbl(box, "Como exportar cookies.txt", bold=True, size=17).pack(anchor="w", pady=(0, 8))
+        txtw = ctk.CTkTextbox(box, corner_radius=12, fg_color=CARD, border_width=1, border_color=BORDER,
+                              text_color=TXT, wrap="word", font=font(13))
+        txtw.pack(fill="both", expand=True)
+        txtw.insert("1.0", COOKIE_STEPS)
+        txtw.configure(state="disabled")
+        self.ckhelp_txt = txtw
+        links = ctk.CTkFrame(box, fg_color="transparent")
+        links.pack(fill="x", pady=(10, 0))
+        btn(links, "Abrir extensão no Chrome/Edge", lambda: webbrowser.open(COOKIES_EXT_CHROME), "soft").pack(side="left")
+        btn(links, "Abrir no Firefox", lambda: webbrowser.open(COOKIES_EXT_FIREFOX), "soft").pack(side="left", padx=(8, 0))
+        btn(links, "Fechar", win.destroy, "ghost", width=90).pack(side="right")
+        win.after(150, win.focus)
 
     def _log(self, msg):
         text = str(msg).rstrip() + "\n"
@@ -2972,6 +3141,8 @@ class App(ctk.CTk):
                         dirty = True
                     elif kind == "info":
                         self._on_info(msg[1], msg[2], msg[3] if len(msg) > 3 else None)
+                    elif kind == "cookietest":
+                        self._on_cookie_test(msg)
                     elif kind == "info_error":
                         if len(msg) > 3 and msg[3] != self.analyze_try:
                             continue  # erro de uma análise antiga: a atual ainda está valendo

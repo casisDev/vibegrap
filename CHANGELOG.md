@@ -2,6 +2,12 @@
 
 <!-- Ao publicar, crie a tag vX.Y.Z com o mesmo número desta primeira seção (veja CONTRIBUTING.md → Publicar uma versão). -->
 
+## [2.2.4]
+
+- **Ajuda com cookies dentro do programa:** em Configurações, o aviso embaixo de “Cookies do navegador” agora diz na hora se o navegador escolhido deixa o yt-dlp ler os cookies (Firefox sim; Chrome, Edge e Brave novos são protegidos por DPAPI) e o que fazer em cada caso.
+- **“Testar acesso ao site”:** botão em Configurações que tenta ler o link com os cookies atuais e diz, em português, se o site liberou — incluindo a nova tentativa como navegador no Facebook.
+- **“Como exportar cookies.txt”:** passo a passo completo dentro do programa, com botões para abrir a extensão “Get cookies.txt LOCALLY” no Chrome/Edge ou no Firefox.
+
 ## [2.2.3]
 
 - O link colado agora é arrumado antes de usar: tira parâmetros de rastreamento (`fbclid`, `mibextid`, `si`, `utm_*`...), aspas e pontuação, e encontra o endereço mesmo quando você cola o texto junto.

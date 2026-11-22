@@ -138,6 +138,21 @@ check("whatsapp: capa embutida (attached_pic) não conta como vídeo",
                           dict(WV, index=1), dict(WA, index=2)]) is None)
 check("whatsapp: sem vídeo não é problema de conversão", g.whatsapp_problem([WA]) is None)
 
+# ------------------------------------------------------------ dica de cookies por navegador
+check("ck: nenhum navegador -> só público, avisa como resolver",
+      g.browser_cookie_hint("Nenhum")[0] == "off" and "cookies.txt" in g.browser_cookie_hint("Nenhum")[1])
+check("ck: firefox/safari lêem direto",
+      g.browser_cookie_hint("firefox")[0] == "ok" and g.browser_cookie_hint("safari")[0] == "ok")
+check("ck: chrome/edge/brave avisam do DPAPI",
+      all(g.browser_cookie_hint(b)[0] == "warn" and "DPAPI" in g.browser_cookie_hint(b)[1]
+          for b in ("chrome", "edge", "brave")))
+check("ck: opera/vivaldi/chromium avisam que podem proteger",
+      all(g.browser_cookie_hint(b)[0] == "warn" and "cookies.txt" in g.browser_cookie_hint(b)[1]
+          for b in ("opera", "vivaldi", "chromium")))
+check("ck: navegador estranho fica no aviso genérico",
+      g.browser_cookie_hint("netscape")[0] == "warn" and "Firefox" in g.browser_cookie_hint("netscape")[1])
+check("ck: vazio é como nenhum", g.browser_cookie_hint("")[0] == "off" and g.browser_cookie_hint(None)[0] == "off")
+
 # ------------------------------------------------------------ link colado
 check("link: igual não muda", g.normalize_url("https://youtu.be/abc") == "https://youtu.be/abc")
 check("link: tira rastreamento do TikTok",
@@ -932,6 +947,58 @@ check("cookies: o passo a passo também fica no Registro",
       "Get cookies.txt LOCALLY" in app.txt_log.get("1.0", "end"))
 app._show("download")
 calls.clear()
+
+# ajuda de cookies integrada: aviso por navegador + janelas de teste e de passo a passo
+app._show("settings")
+pump(0.1)
+_real_browser = app.v_browser.get()
+app.v_browser.set("chrome")
+app._on_browser_pick("chrome")
+pump(0.05)
+check("ck-ui: escolher Chrome avisa do DPAPI embaixo do menu",
+      "DPAPI" in txt(app.lbl_ckhint), txt(app.lbl_ckhint))
+app.v_browser.set("firefox")
+app._on_browser_pick("firefox")
+pump(0.05)
+check("ck-ui: trocar para Firefox vira aviso positivo",
+      "lidos direto" in txt(app.lbl_ckhint), txt(app.lbl_ckhint))
+check("ck-ui: a troca é salva nas configurações",
+      _json.load(open(g.SETTINGS_FILE, encoding="utf-8")).get("browser") == "firefox")
+
+app._test_cookies_dialog()
+pump(0.3)
+check("ck-ui: janela de teste abre com o link atual",
+      app.ck_win.winfo_exists() and app.v_ckurl.get() == app._url(), (app.v_ckurl.get(), app._url()))
+check("ck-ui: janela de teste tem botão e área de resultado",
+      txt(app.btn_cktest) == "Testar" and app.lbl_ckresult.cget("text") == "", txt(app.btn_cktest))
+app.q.put(("cookietest", True, "Vídeo de teste"))
+pump(0.3)
+check("ck-ui: resultado ok mostra o título e o emoji de liberou",
+      "Liberou" in txt(app.lbl_ckresult) and "Vídeo de teste" in txt(app.lbl_ckresult), txt(app.lbl_ckresult))
+app.q.put(("cookietest", False, "ERROR: Sign in to confirm your age"))
+pump(0.3)
+check("ck-ui: resultado falho traduz o erro e aponta os cookies",
+      txt(app.lbl_ckresult).startswith("❌") and "Configurações" in txt(app.lbl_ckresult)
+      and "Cookies do navegador" in txt(app.lbl_ckresult), txt(app.lbl_ckresult))
+app.q.put(("cookietest", False, "ERROR: Failed to decrypt with DPAPI"))
+pump(0.3)
+check("ck-ui: falha de DPAPI na janela mostra o passo a passo",
+      "LOCALLY" in txt(app.lbl_ckresult), txt(app.lbl_ckresult)[:120])
+check("ck-ui: o teste fica no Registro",
+      "Teste de cookies" in app.txt_log.get("1.0", "end"))
+app.ck_win.destroy()
+
+app._cookies_help_dialog()
+pump(0.3)
+_ckhelp = app.ckhelp_win
+check("ck-ui: janela de passo a passo abre com as 5 etapas",
+      _ckhelp.winfo_exists() and "Get cookies.txt LOCALLY" in app.ckhelp_txt.get("1.0", "end")
+      and "Testar acesso" in app.ckhelp_txt.get("1.0", "end"))
+_ckhelp.destroy()
+
+app.v_browser.set(_real_browser)
+app._on_browser_pick(_real_browser)
+app._show("download")
 
 # instalador silencioso: comando exato (sem fechar o teste!)
 cmd = app._launch_installer(r"C:\Temp\VibeGrap-Setup.exe")
