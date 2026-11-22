@@ -8,6 +8,7 @@
 - TikTok: instalado o suporte a *impersonation* (`curl_cffi`) que o yt-dlp usa para passar pela verificação do site; novos avisos explicam o que fazer quando o TikTok ou o Instagram recusam o link (atualizar o yt-dlp, usar cookies do navegador).
 - O link colado agora é arrumado antes de usar: tira parâmetros de rastreamento (`fbclid`, `mibextid`, `si`, `utm_*`...), aspas e pontuação, e encontra o endereço mesmo quando você cola o texto junto.
 - Facebook: quando o site recusa o acesso (`Cannot parse data`), o programa tenta de novo se passando por um navegador (Firefox), que é o que resolve muitos vídeos por lá. Se continuar, a mensagem explica que pode ser login/restrição de idade e indica os cookies do navegador.
+- Mensagens de erro melhores para sites que exigem login (Vimeo, Facebook, X...) e para o 403 causado por VPN/proxy, com o caminho para resolver em cada caso.
 
 ## [2.2.1]
 

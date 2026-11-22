@@ -1292,6 +1292,12 @@ check("erro: TikTok com página mudada pede para atualizar o yt-dlp",
 check("erro: 'Cannot parse data' (Facebook) sugere cookies e atualização",
       "cookies" in FE("ERROR: [facebook] 123: Cannot parse data; please report this issue"),
       FE("ERROR: [facebook] 123: Cannot parse data"))
+check("erro: Vimeo 'logged-in' pede cookies",
+      "login" in FE("ERROR: [vimeo] 1: The web client only works when logged-in. Use --cookies"),
+      FE("ERROR: [vimeo] 1: The web client only works when logged-in"))
+check("erro: 403 lembra da VPN/proxy",
+      "VPN" in FE("ERROR: [vimeo] 1: Got HTTP Error 403 when using impersonate target"),
+      FE("ERROR: [vimeo] 1: Got HTTP Error 403"))
 check("erro: Instagram sem login pede os cookies do navegador",
       "Instagram" in FE("ERROR: [Instagram] abc: Instagram sent an empty media response. Check if this post is accessible"),
       FE("ERROR: [Instagram] abc: Instagram sent an empty media response"))
