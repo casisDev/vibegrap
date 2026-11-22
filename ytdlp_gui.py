@@ -334,6 +334,28 @@ def detect_js_runtime():
 WHATSAPP_EXTS = (".mp4", ".m4v", ".mov")
 WHATSAPP_PIX_FMTS = ("yuv420p", "yuvj420p")
 
+FACEBOOK_URLS = re.compile(r"(?:facebook\.com|fb\.watch|fb\.me)/", re.I)
+IMPERSONATE_ERRORS = re.compile(
+    r"cannot parse data|unable to (extract|download webpage|parse)|failed to parse json|"
+    r"http error 403|forbidden|empty media response",
+    re.I,
+)
+
+
+def impersonate_target():
+    """Navegador que o yt-dlp pode imitar (precisa do curl_cffi); None se não der."""
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        return ImpersonateTarget.from_str("firefox")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def needs_impersonate_retry(url, error):
+    """O Facebook recusa muitos vídeos sem que o yt-dlp se passe por navegador (issue 17906)."""
+    return bool(FACEBOOK_URLS.search(str(url or ""))) and bool(IMPERSONATE_ERRORS.search(str(error or "")))
+
 
 def _no_window():
     """Impede que o ffmpeg/ffprobe abram uma janela de console no Windows."""
@@ -833,6 +855,10 @@ ERROR_RULES = [
      "onde você está logado no Instagram e tente de novo."),
     (r"unable to extract webpage video data|failed to parse json|could not find any video",
      "O site mudou a página e o yt-dlp não conseguiu ler o vídeo. Atualize o yt-dlp em Ferramentas e tente de novo."),
+    (r"cannot parse data",
+     "O site não deixou o yt-dlp ler o vídeo: pode ser login, restrição de idade ou uma mudança no site "
+     "(o Facebook tem feito isso com frequência). Tente de novo com os cookies do navegador em que você está "
+     "logado (Configurações) e atualize o yt-dlp em Ferramentas."),
     (r"getaddrinfo|name or service not known|temporary failure in name resolution|network is unreachable|"
      r"timed out|timeout|connection (reset|refused|aborted)|remote end closed|urlopen error|unable to download webpage|"
      r"unable to connect|failed to resolve|ssl",
@@ -846,6 +872,27 @@ def clean_error(text):
     text = re.sub(r"^(ERROR:\s*)+", "", text)
     text = re.sub(r"^(?:\[[A-Za-z][\w:.-]*\]\s*(?:[\w-]+:\s+)?)+", "", text).strip()
     return text
+
+
+# Parâmetros que só servem para rastrear quem compartilhou o link (nunca identificam o vídeo).
+JUNK_URL_PARAMS = frozenset((
+    "fbclid", "mibextid", "si", "igsh", "igshid", "is_from_webapp", "sender_device", "web_id",
+    "ref_src", "ref_url", "ref_tag", "share_source", "share_medium", "tt_from",
+    "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+))
+
+
+def normalize_url(text):
+    """Arruma o link colado: extrai o endereço de um texto maior, tira pontuação colada
+    e parâmetros de rastreamento (fbclid, mibextid, utm_*, “si”, compartilhado pelo app...)."""
+    m = re.search(r"https?://\S+", str(text or ""))
+    url = (m.group(0) if m else str(text or "")).strip("\"'<>“”‘’«»").rstrip(".,;:!?)]}…")
+    parts = re.match(r"^(https?://[^?#]+)(\?[^#]*)?(#.*)?$", url, re.I)
+    if parts:
+        base, query, frag = parts.group(1), parts.group(2) or "", parts.group(3) or ""
+        keep = [kv for kv in query[1:].split("&") if kv and kv.split("=", 1)[0].lower() not in JUNK_URL_PARAMS]
+        url = base + (("?" + "&".join(keep)) if keep else "") + frag
+    return url
 
 
 COOKIE_ERROR = re.compile(
@@ -2026,7 +2073,7 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ pequenos handlers
     def _url(self):
-        return self.ent_url.get().strip()
+        return normalize_url(self.ent_url.get())
 
     def _on_seg(self, label):
         self.v_mode.set(MODE_LABELS[label])
@@ -2208,13 +2255,25 @@ class App(ctk.CTk):
         threading.Thread(target=self._analyze_worker, args=(url, opts, self.analyze_try), daemon=True).start()
 
     def _analyze_worker(self, url, opts, attempt=0):
+        def extrair(o):
+            with yt_dlp.YoutubeDL(o) as ydl:
+                return ydl.sanitize_info(ydl.extract_info(url, download=False))
+
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                info = ydl.sanitize_info(info)
-            self.q.put(("info", url, info, attempt))
+            info = extrair(opts)
         except Exception as exc:  # noqa: BLE001
-            self.q.put(("info_error", url, str(exc), attempt))
+            target = impersonate_target()
+            if not target or not needs_impersonate_retry(url, exc):
+                self.q.put(("info_error", url, str(exc), attempt))
+                return
+            self.q.put(("log", f"Falhou: {clean_error(exc)}"))
+            self.q.put(("log", f"O Facebook recusou o acesso; analisando de novo como navegador ({target})..."))
+            try:
+                info = extrair(dict(opts, impersonate=target))
+            except Exception as exc2:  # noqa: BLE001
+                self.q.put(("info_error", url, str(exc2), attempt))
+                return
+        self.q.put(("info", url, info, attempt))
 
     def _analyze_recover(self, exc):
         """A análise não pôde ser mostrada (erro interno): destrava a tela em vez de ficar em “Analisando…”."""
@@ -2644,6 +2703,30 @@ class App(ctk.CTk):
         self.v_status.set("Cancelando…")
 
     # ------------------------------------------------------------ download (thread)
+    def _download(self, item, opts):
+        """Baixa um item. Se o Facebook recusar o acesso, tenta de novo se passando por
+        navegador (é o que costuma resolver lá; veja o issue 17906 do yt-dlp)."""
+        target = impersonate_target()
+        primeira = True
+        while True:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    if item.get("compat"):
+                        ydl.add_post_processor(CompatMP4PP(ydl, should_stop=self.cancel.is_set), when="after_move")
+                    return ydl.download([item["url"]])
+            except Cancelado:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if self.cancel.is_set():
+                    raise Cancelado() from exc
+                if not primeira or not target or not needs_impersonate_retry(item["url"], exc):
+                    raise
+                primeira = False
+                self.q.put(("log", f"Falhou: {clean_error(exc)}"))
+                self.q.put(("log", f"O Facebook recusou o acesso; tentando de novo como navegador ({target})..."))
+                opts = dict(opts, impersonate=target)
+                self._reset_progress(item)
+
     def _worker(self):
         ok = failed = 0
         while not self.cancel.is_set():
@@ -2661,10 +2744,7 @@ class App(ctk.CTk):
             self.q.put(("log", f"\n=== {item['title']}"))
             error = ""
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    if item.get("compat"):
-                        ydl.add_post_processor(CompatMP4PP(ydl, should_stop=self.cancel.is_set), when="after_move")
-                    code = ydl.download([item["url"]])
+                code = self._download(item, opts)
                 if code:
                     item["status"] = "Concluído com avisos" if item.get("playlist") else "Erro"
                     error = "O yt-dlp terminou com erro. Veja o Registro para os detalhes."

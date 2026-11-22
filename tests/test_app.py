@@ -138,6 +138,31 @@ check("whatsapp: capa embutida (attached_pic) não conta como vídeo",
                           dict(WV, index=1), dict(WA, index=2)]) is None)
 check("whatsapp: sem vídeo não é problema de conversão", g.whatsapp_problem([WA]) is None)
 
+# ------------------------------------------------------------ link colado
+check("link: igual não muda", g.normalize_url("https://youtu.be/abc") == "https://youtu.be/abc")
+check("link: tira rastreamento do TikTok",
+      g.normalize_url("https://www.tiktok.com/@user/video/123?is_from_webapp=1&sender_device=pc&web_id=9")
+      == "https://www.tiktok.com/@user/video/123",
+      g.normalize_url("https://www.tiktok.com/@user/video/123?is_from_webapp=1&sender_device=pc&web_id=9"))
+check("link: tira fbclid/mibextid do Facebook",
+      g.normalize_url("https://www.facebook.com/reel/123?mibextid=abc&fbclid=xyz") == "https://www.facebook.com/reel/123")
+check("link: tira si do YouTube e mantém v e t",
+      g.normalize_url("https://www.youtube.com/watch?v=abc123&t=30s&si=xyz") == "https://www.youtube.com/watch?v=abc123&t=30s")
+check("link: extrai de um texto colado",
+      g.normalize_url("Olha esse vídeo https://youtu.be/abc?t=9&si=z") == "https://youtu.be/abc?t=9")
+check("link: aspas e pontuação coladas",
+      g.normalize_url('“https://x.com/a/status/1?si=z”.') == "https://x.com/a/status/1",
+      g.normalize_url('“https://x.com/a/status/1?si=z”.'))
+check("link: fragmento fica", g.normalize_url("https://youtu.be/abc#t=10") == "https://youtu.be/abc#t=10")
+check("link: sem query e vazio", g.normalize_url("https://vimeo.com/123") == "https://vimeo.com/123"
+      and g.normalize_url("") == "" and g.normalize_url(None) == "")
+check("impersonation: só para Facebook e só em erro típico",
+      g.needs_impersonate_retry("https://www.facebook.com/reel/1", "ERROR: [facebook] 1: Cannot parse data")
+      and g.needs_impersonate_retry("https://fb.watch/abc/", "HTTP Error 403: Forbidden")
+      and not g.needs_impersonate_retry("https://www.youtube.com/watch?v=x", "Cannot parse data")
+      and not g.needs_impersonate_retry("https://www.facebook.com/reel/1", "Private video. Sign in to watch"))
+
+
 # ------------------------------------------------------------ nomes de arquivo
 single = {"id": "abc", "title": "Meu Vídeo", "ext": "mp4", "uploader": "Canal", "playlist_title": None, "playlist_index": None}
 plist = dict(single, playlist_title="Lista", playlist_index=3)
@@ -213,6 +238,7 @@ INFO = {
 }
 URL = "https://example.test/watch?v=x"
 set_url(URL)
+check("UI: o link colado é limpo ao ser usado (texto e rastreamento fora)", app._url() == URL, app._url())
 app._on_info(URL, INFO)
 pump(0.1)
 check("UI: faixas de áudio listadas", app.pl_audio.size() == 3 and app.audio_langs == ["en", "pt-BR"] or app.pl_audio.size() == 2, app.pl_audio.get_all())
@@ -430,6 +456,73 @@ app._refresh_row = real_refresh
 app.items.pop("zz")
 app.run_ids.clear()
 del app.state
+
+# ------------------------------------------------------------ Facebook: tenta de novo como navegador
+class FakeYDL:
+    """Falha na 1ª vez com erro do Facebook e funciona na 2ª."""
+
+    calls = []
+
+    def __init__(self, opts):
+        self.opts = opts
+        FakeYDL.calls.append(opts)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def download(self, urls):
+        if len(FakeYDL.calls) == 1:
+            raise Exception("ERROR: [facebook] 1: Cannot parse data; please report this issue")
+        return 0
+
+    def extract_info(self, url, download=False):
+        if len(FakeYDL.calls) == 1:
+            raise Exception("ERROR: [facebook] 1: Cannot parse data; please report this issue")
+        return {"title": "ok do facebook", "formats": []}
+
+    def sanitize_info(self, info):
+        return info
+
+
+real_ydl, real_target = g.yt_dlp.YoutubeDL, g.impersonate_target
+g.yt_dlp.YoutubeDL = FakeYDL
+g.impersonate_target = lambda: "firefox-fake"
+
+
+def drain_q():
+    msgs = []
+    while not app.q.empty():
+        msgs.append(app.q.get_nowait())
+    return msgs
+
+
+fake_item = {"url": "https://www.facebook.com/reel/1", "compat": False, "opts": {}, "files": {}, "entries": {}}
+FakeYDL.calls = []
+code = app._download(fake_item, {})
+check("impersonation: o download do Facebook é refeito como navegador",
+      code == 0 and len(FakeYDL.calls) == 2 and FakeYDL.calls[1].get("impersonate") == "firefox-fake",
+      (code, len(FakeYDL.calls), [c.get("impersonate") for c in FakeYDL.calls]))
+drain_q()
+
+FakeYDL.calls = []
+app._analyze_worker("https://www.facebook.com/reel/1", {"quiet": True}, 77)
+msgs = drain_q()
+check("impersonation: a análise do Facebook também é refeita",
+      len(FakeYDL.calls) == 2 and [m[0] for m in msgs] == ["log", "log", "info"] and msgs[-1][3] == 77,
+      ([c.get("impersonate") for c in FakeYDL.calls], [m[0] for m in msgs]))
+
+FakeYDL.calls = []
+try:
+    app._download({"url": "https://www.youtube.com/watch?v=x", "compat": False, "opts": {}, "files": {}, "entries": {}}, {})
+    check("impersonation: outros sites não tentam de novo", False)
+except Exception:
+    check("impersonation: outros sites não tentam de novo", len(FakeYDL.calls) == 1, len(FakeYDL.calls))
+drain_q()
+
+g.yt_dlp.YoutubeDL, g.impersonate_target = real_ydl, real_target
 
 # ------------------------------------------------------------ download de ponta a ponta (servidor local)
 media = os.path.join(TMP, "media")
@@ -1196,6 +1289,9 @@ check("erro: formato indisponível", "Melhor disponível" in FE("ERROR: Requeste
 check("erro: link não suportado", "suportado" in FE("ERROR: Unsupported URL: https://example.com/x"))
 check("erro: TikTok com página mudada pede para atualizar o yt-dlp",
       "Atualize o yt-dlp" in FE("ERROR: [TikTok] 770: Unable to extract webpage video data"), FE("ERROR: [TikTok] 770: Unable to extract webpage video data"))
+check("erro: 'Cannot parse data' (Facebook) sugere cookies e atualização",
+      "cookies" in FE("ERROR: [facebook] 123: Cannot parse data; please report this issue"),
+      FE("ERROR: [facebook] 123: Cannot parse data"))
 check("erro: Instagram sem login pede os cookies do navegador",
       "Instagram" in FE("ERROR: [Instagram] abc: Instagram sent an empty media response. Check if this post is accessible"),
       FE("ERROR: [Instagram] abc: Instagram sent an empty media response"))

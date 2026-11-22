@@ -6,6 +6,8 @@
 - Corrigido: analisar um link depois de outro podia travar a tela em "Analisando o link…" e registrar `image "pyimage…" doesn't exist` no Registro. Agora a miniatura é limpa sem deixar uma imagem apagada, erros internos avisam e destravam o botão, e respostas de análises antigas são ignoradas.
 - Vídeo em **MP4** agora sai em **H.264 + AAC**, o padrão que o WhatsApp, TVs e celulares aceitam: converte HEVC/VP9/AV1 e áudio HE-AAC quando preciso e acrescenta uma faixa silenciosa em vídeos mudos (o que costuma fazer o WhatsApp recusar arquivos baixados do Instagram). Em MKV/WEBM o codec original é mantido.
 - TikTok: instalado o suporte a *impersonation* (`curl_cffi`) que o yt-dlp usa para passar pela verificação do site; novos avisos explicam o que fazer quando o TikTok ou o Instagram recusam o link (atualizar o yt-dlp, usar cookies do navegador).
+- O link colado agora é arrumado antes de usar: tira parâmetros de rastreamento (`fbclid`, `mibextid`, `si`, `utm_*`...), aspas e pontuação, e encontra o endereço mesmo quando você cola o texto junto.
+- Facebook: quando o site recusa o acesso (`Cannot parse data`), o programa tenta de novo se passando por um navegador (Firefox), que é o que resolve muitos vídeos por lá. Se continuar, a mensagem explica que pode ser login/restrição de idade e indica os cookies do navegador.
 
 ## [2.2.1]
 

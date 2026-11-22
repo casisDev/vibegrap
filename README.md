@@ -109,6 +109,7 @@ python ytdlp_gui.py
 
 - **O YouTube não baixa / erro de “challenge” ou assinatura:** abra **Ferramentas → Atualizar o yt-dlp** e reabra o programa; se persistir, baixe ali mesmo o **Deno** (os sites mudam com frequência).
 - **TikTok ou Instagram recusam o link:** atualize o yt-dlp em **Ferramentas** e tente de novo. O Instagram costuma exigir login: use os **cookies do navegador** em **Configurações** (no TikTok eles também ajudam).
+- **Facebook, X/Twitter, Vimeo e outros que exigem login:** esses sites só liberam muitos vídeos para quem está logado. Use os **cookies do navegador** (Firefox logado no site) em **Configurações**, ou um **`cookies.txt`**. No Facebook o programa já tenta de novo automaticamente se passando por um navegador; se o erro for `Cannot parse data`, o vídeo pode ser restrito ou o site mudou — veja se ele abre no navegador sem login e atualize o yt-dlp em **Ferramentas**.
 - **Vídeo com login ou restrição de idade:** use o **Firefox** logado em **Configurações → Cookies do navegador**, ou exporte um **`cookies.txt`** (extensão “Get cookies.txt LOCALLY”) e escolha o arquivo em **Configurações → “ou arquivo cookies.txt”**. Chrome, Brave e Edge novos protegem os cookies (DPAPI) e o yt-dlp não consegue lê-los.
 - **“ffmpeg não encontrado”:** abra **Ferramentas → Baixar / atualizar ffmpeg**.
 - **A playlist baixou só um vídeo:** cole o link, clique em **Analisar** e marque os itens; sem analisar, o programa trata o link como vídeo único.
